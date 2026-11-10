@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.josaum.tether-menubar</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__USER_HOME__/Applications/TetherMenubar.app/Contents/MacOS/tether-menubar</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TETHER_HOME</key>
+    <string>__USER_HOME__</string>
+    <key>TETHER_BIN</key>
+    <string>__BIN_DIR__/tether-optimize</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>StandardOutPath</key>
+  <string>__USER_HOME__/Library/Logs/tether-menubar.log</string>
+  <key>StandardErrorPath</key>
+  <string>__USER_HOME__/Library/Logs/tether-menubar.log</string>
+</dict>
+</plist>

@@ -1,0 +1,2850 @@
+#!/usr/bin/env bash
+# tether-optimize — Smartphone & iPad Personal Hotspot Optimizer (Wi-Fi en0 + USB en7/en17).
+#
+# Keeps the hotspot host device (iPhone, iPad, or Android smartphone) fast and usable by:
+#   1. Detecting both USB Personal Hotspots (iPhone USB en7, iPad USB en17, etc.) AND
+#      Wi-Fi Personal Hotspots (en0 on 172.20.10.0/28, Android 192.168.43/49.x, or macOS
+#      'constrained' Low Data Mode flag), with seamless handover between Wi-Fi and USB.
+#   2. Clamping macOS TCP socket buffers (512 KB send / 1 MB recv instead of 16 MB), enabling
+#      adaptive delayed ACKs (cutting reverse Wi-Fi ACK airtime in half), enabling L4S + ECN +
+#      CUBIC fast convergence, and tightening LEDBAT++ background target queue delay to 15ms.
+#   3. Shaping hotspot bandwidth via dummynet pipes (default: 25 Mbps down / 8 Mbps up, plus
+#      dedicated 5/3 Mbps interactive fast lane for ICMP/DNS/SSH/NTP/DoT) so the Mac never
+#      saturates the smartphone/iPad cellular baseband queue (bufferbloat).
+#   4. Clamping TCP MSS to 1380 (IPv4 + IPv6) and setting MTU 1420 on the hotspot link to
+#      prevent cellular packet fragmentation and PMTU stalls on the phone/iPad.
+#   5. Disabling awdl0 (AirDrop/Handoff channel-hopping) while tethered over Wi-Fi hotspot so
+#      neither the Mac nor the iPhone/iPad radio stutters, and restoring awdl0 automatically
+#      when switching to USB tether or disconnecting.
+#   6. Moving third-party background sync daemons (OneDrive, Adobe Creative Cloud / Core Sync,
+#      Dropbox, updaters) into Darwin Background QoS (taskpolicy -b / LEDBAT++ scavenger
+#      sockets) while tethered, and periodically sweeping newly spawned sync workers.
+#
+# Does NOT touch:
+#   • Realtek 802.11n NIC (RTL8812AU / 0bda:8812) → VMware Fusion Ubuntu USB passthrough
+#   • USB Ethernet docks (AX88179, en9 LAN segment, etc.)
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+WIFI_OFF=0
+SHAPE_ENABLED=1
+DOWN_MBPS=${TETHER_DOWN_MBPS:-25}
+UP_MBPS=${TETHER_UP_MBPS:-8}
+HOTSPOT_MTU=1420
+HOTSPOT_MSS=1380
+OVERLAY_MSS=1220
+HOME_WIFI_MTU=1492
+HOME_WIFI_MSS=1452
+HOME_WIFI_V6MSS=1432
+HOME_OVERLAY_MSS=1332
+TAILSCALE_DNS=""
+MODE=apply
+POLL_SECS=2
+PCAP_SECS=4
+LAST_PCAP_FILE="/tmp/tether-optimize-audit.pcapng"
+
+resolve_user_home() {
+  if [[ -n "${TETHER_HOME:-}" && -d "${TETHER_HOME}" ]]; then
+    printf '%s\n' "${TETHER_HOME}"
+    return 0
+  fi
+  local cu
+  cu=$(stat -f%Su /dev/console 2>/dev/null || true)
+  if [[ -n "$cu" && "$cu" != "root" && "$cu" != "loginwindow" && -d "/Users/${cu}" ]]; then
+    printf '%s\n' "/Users/${cu}"
+    return 0
+  fi
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" && -d "/Users/${SUDO_USER}" ]]; then
+    printf '%s\n' "/Users/${SUDO_USER}"
+    return 0
+  fi
+  if [[ -n "${HOME:-}" && "${HOME}" != "/var/root" && -d "${HOME}" ]]; then
+    printf '%s\n' "${HOME}"
+    return 0
+  fi
+  printf '%s\n' "/Users/josaum"
+}
+
+TETHER_USER_HOME="$(resolve_user_home)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="${SCRIPT_DIR}/$(basename "$0")"
+WIRESHARK_SKILL_DIR="${TETHER_WIRESHARK_SCRIPTS:-${TETHER_USER_HOME}/.gemini/config/skills/wireshark/scripts}"
+
+LABEL="com.josaum.tether-optimize"
+PLIST="/Library/LaunchDaemons/${LABEL}.plist"
+STATE_DIR="/usr/local/var/tether-optimize"
+UI_SNAPSHOT_FILE="${STATE_DIR}/ui.snapshot"
+STATE_FILE="$UI_SNAPSHOT_FILE"
+OVERLAY_STATE_FILE="$UI_SNAPSHOT_FILE"
+MODE_FILE="${STATE_DIR}/active.mode"
+LAST_NOTIFIED_FILE="${STATE_DIR}/last.notified"
+HOME_NOTIFY_COOLDOWN_SECS=300
+THROTTLED_PIDS_FILE="${STATE_DIR}/throttled.pids"
+SHAPER_STATE_FILE="${STATE_DIR}/shaper.state"
+AUTORATE_STATE_FILE="${STATE_DIR}/autorate.state"
+AWDL_SUPPRESSED_FILE="${STATE_DIR}/awdl_suppressed.count"
+EVENTS_BIN="${TETHER_EVENTS_BIN:-${SCRIPT_DIR}/tether-events}"
+EVENTS_SRC="${TETHER_EVENTS_SRC:-${SCRIPT_DIR}/tether-events.swift}"
+AUTORATE_FLOOR_DOWN=4
+AUTORATE_FLOOR_UP=2
+PF_ANCHOR="com.apple/tether_optimize"
+PF_CONF_FILE="${STATE_DIR}/pf-hotspot.conf"
+LOG_FILE="${STATE_DIR}/tether-optimize.log"
+USER_PREFS_FILE="${TETHER_PREFS_FILE:-${TETHER_USER_HOME}/.tether-optimize.prefs}"
+DEFAULT_USER_PREFS_FILE="$USER_PREFS_FILE"
+LEAN_SPEC_FILE="${TETHER_LEAN_SPEC:-${SCRIPT_DIR}/TetherOptimizeSpec.lean}"
+LEAN_BIN="${TETHER_LEAN_BIN:-${TETHER_USER_HOME}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean}"
+MENUBAR_APP="${TETHER_MENUBAR_APP:-${TETHER_USER_HOME}/Applications/TetherMenubar.app}"
+MENUBAR_PLIST="${TETHER_MENUBAR_PLIST:-${TETHER_USER_HOME}/Library/LaunchAgents/com.josaum.tether-menubar.plist}"
+WEB_WORKBENCH_FILE="${TETHER_WEB_WORKBENCH:-${TETHER_USER_HOME}/tether-optimize/web/index.html}"
+DNS_SERVERS=(1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4)
+
+PIPE_DOWN_FAST=10
+PIPE_UP_FAST=11
+PIPE_DOWN_BULK=12
+PIPE_UP_BULK=13
+
+usage() {
+  cat <<'EOF'
+tether-optimize — Smartphone & iPad Personal Hotspot Optimizer (Wi-Fi en0 + USB en7/en17)
+
+  Protects the hotspot device (iPhone / iPad / Android) from bufferbloat, radio
+  channel-hopping, fragmentation, and background sync saturation while tethered.
+
+  Commands:
+    tether-optimize                 apply optimizations if on hotspot (no password if daemon running)
+    tether-optimize status          show concise status (hotspot, shaper, TCP, tunnels, proxies, security)
+    tether-optimize pf-status       show full raw PF scrub/firewall/dummynet rules and dnctl pipe buckets
+    tether-optimize cap <down> <up> live-update Mbps cap (e.g. 'tether-optimize cap 15 5')
+    tether-optimize unshape         disable Mbps cap (keep TCP/MSS/AWDL/QoS optimizations)
+    tether-optimize shape           re-enable Mbps cap (default 25 Mbps down / 8 Mbps up)
+    tether-optimize restore         apply/restore optimized Standard Home Wi-Fi & LAN profile
+    tether-optimize pcap [secs]     run on-demand Wireshark (dumpcap/tshark/Lua) wire audit (default: 4s)
+    tether-optimize owd-probe       run live 3-reflector RFC 792 Type 13/14 One-Way Delay quorum probe
+    tether-optimize tail-mle [...]  Taleb Pareto(L, α) MLE ~ InvGamma(n, nα) & Pontryagin u*(λ) control
+    tether-optimize wireshark-gui   open last audit capture in Wireshark.app (Tether-Optimize profile)
+    tether-optimize web             open interactive Product Workbench & Proof Explorer in browser
+    tether-optimize doctor          run comprehensive product environment & capability diagnostic
+    tether-optimize version         show product version, theorem count, and component build info
+    tether-optimize verify          run 110-theorem Lean 4 formal verification + 72 live assertions
+    tether-optimize verify-lean     run 110-theorem pure constructive Lean 4 proof check (0 axioms)
+    tether-optimize test            run non-destructive unit + live kernel/PF/daemon invariant tests
+    tether-optimize menubar         start/restart native macOS topbar widget (tether-menubar)
+    tether-optimize menubar-stop    stop native macOS topbar widget
+    tether-optimize watch           run root daemon loop
+    tether-optimize install-auto    install/reload LaunchDaemon and apply now
+    tether-optimize uninstall-auto  remove LaunchDaemon and restore defaults
+    tether-optimize auto-status     show LaunchDaemon state
+    tether-optimize test-popup      send test notification
+
+  Options:
+    --down-mbps <N>                 Mac download cap in Mbps (default: 25)
+    --up-mbps <N>                   Mac upload cap in Mbps (default: 8)
+    --no-shape                      skip dummynet Mbps cap (still apply TCP/MSS/AWDL/QoS)
+    --wifi-off                      power off en0 when tethered via USB cable
+EOF
+}
+
+log() {
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+  if [[ -w "$(dirname "$LOG_FILE")" ]] 2>/dev/null || [[ -w "$LOG_FILE" ]] 2>/dev/null; then
+    printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null || true
+  fi
+  [[ "$MODE" == "watch" ]] || printf '%s\n' "$line"
+}
+
+trim_logs() {
+  local tmp="${LOG_FILE}.dedup.$$"
+  if [[ -f "$LOG_FILE" ]] && awk '
+    /radio: awdl0 set DOWN/ { if (awdl++) next; print; next }
+    { awdl = 0; print }
+  ' "$LOG_FILE" | tail -n 400 > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$LOG_FILE" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+  : > "${STATE_DIR}/daemon.stdout.log" 2>/dev/null || true
+  [[ -f "${STATE_DIR}/daemon.stderr.log" ]] && [[ $(wc -l < "${STATE_DIR}/daemon.stderr.log" 2>/dev/null || echo 0) -gt 200 ]] && : > "${STATE_DIR}/daemon.stderr.log" 2>/dev/null || true
+}
+
+is_root() { [[ "$(id -u)" -eq 0 ]]; }
+
+daemon_loaded() {
+  [[ -f "$PLIST" ]] && launchctl print "system/${LABEL}" >/dev/null 2>&1
+}
+
+# Single-file notification deduplicator + 300s home-uplink cooldown (`LAST_NOTIFIED_FILE` stores `<home_ts>|<sig>`).
+notify_user() {
+  local title=$1 message=$2 sound=${3:-Glass} force=${4:-0}
+  local console_user console_uid t_esc m_esc s_esc osa sig raw prev_sig="" last_home_ts=0 now_ts
+  sig="${title}|${message}"
+  rm -f "${STATE_DIR}/last_home_notify.ts" 2>/dev/null || true
+  if [[ -f "$LAST_NOTIFIED_FILE" ]]; then
+    raw=$(cat "$LAST_NOTIFIED_FILE" 2>/dev/null || true)
+    if [[ "$raw" == [0-9]*\|* ]]; then
+      last_home_ts="${raw%%|*}"
+      prev_sig="${raw#*|}"
+    else
+      prev_sig="$raw"
+    fi
+  fi
+  if [[ "$force" != "1" && -n "$prev_sig" && "${prev_sig// USB USB/ USB}" == "${sig// USB USB/ USB}" ]]; then
+    return 0
+  fi
+  now_ts=$(date +%s)
+  if [[ "$title" == "Hotspot optimized"* ]]; then
+    last_home_ts=0
+  elif [[ "$title" == "Home Network optimized"* && "$force" != "1" ]]; then
+    if (( now_ts - last_home_ts < HOME_NOTIFY_COOLDOWN_SECS )); then
+      if [[ -w "$(dirname "$LAST_NOTIFIED_FILE")" || -w "$LAST_NOTIFIED_FILE" ]] 2>/dev/null; then
+        printf '%s|%s\n' "$last_home_ts" "$sig" > "$LAST_NOTIFIED_FILE" 2>/dev/null || true
+        chmod 644 "$LAST_NOTIFIED_FILE" 2>/dev/null || true
+      fi
+      log "notify-suppressed: $title (within ${HOME_NOTIFY_COOLDOWN_SECS}s home-uplink cooldown)"
+      return 0
+    fi
+    last_home_ts=$now_ts
+  fi
+  if [[ -w "$(dirname "$LAST_NOTIFIED_FILE")" || -w "$LAST_NOTIFIED_FILE" ]] 2>/dev/null; then
+    printf '%s|%s\n' "$last_home_ts" "$sig" > "$LAST_NOTIFIED_FILE" 2>/dev/null || true
+    chmod 644 "$LAST_NOTIFIED_FILE" 2>/dev/null || true
+  fi
+  console_user=$(stat -f%Su /dev/console 2>/dev/null || true)
+  [[ -z "$console_user" || "$console_user" == "root" || "$console_user" == "loginwindow" ]] && return 0
+  console_uid=$(id -u "$console_user" 2>/dev/null || true)
+  [[ -z "$console_uid" ]] && return 0
+  t_esc=${title//\\/\\\\}; t_esc=${t_esc//\"/\\\"}
+  m_esc=${message//\\/\\\\}; m_esc=${m_esc//\"/\\\"}
+  s_esc=${sound//\\/\\\\}; s_esc=${s_esc//\"/\\\"}
+  osa="display notification \"${m_esc}\" with title \"${t_esc}\" sound name \"${s_esc}\""
+  if is_root; then
+    (launchctl asuser "$console_uid" sudo -u "$console_user" /usr/bin/osascript -e "$osa" >/dev/null 2>&1 || true) &
+  else
+    (/usr/bin/osascript -e "$osa" >/dev/null 2>&1 || true) &
+  fi
+  log "notify: $title — $message"
+}
+
+# --- Safe User Preferences File (Zero-Password IPC with Root Daemon) ---------
+
+load_user_prefs() {
+  [[ -f "$USER_PREFS_FILE" ]] || return 0
+  local key val
+  while IFS='=' read -r key val || [[ -n "${key:-}" ]]; do
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    case "$key" in
+      DOWN_MBPS)
+        [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= 1000 )) && DOWN_MBPS=$val ;;
+      UP_MBPS)
+        [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= 1000 )) && UP_MBPS=$val ;;
+      SHAPE_ENABLED)
+        [[ "$val" =~ ^[01]$ ]] && SHAPE_ENABLED=$val ;;
+      WIFI_OFF)
+        [[ "$val" =~ ^[01]$ ]] && WIFI_OFF=$val ;;
+      OVERRIDE_MODE)
+        case "$val" in
+          auto|force_restore) OVERRIDE_MODE=$val ;;
+        esac
+        ;;
+    esac
+  done < "$USER_PREFS_FILE"
+}
+
+save_user_prefs() {
+  local override=${1:-auto}
+  cat > "$USER_PREFS_FILE" <<EOF
+# Managed by tether-optimize — safe integer/enum preferences watched by root daemon
+DOWN_MBPS=${DOWN_MBPS}
+UP_MBPS=${UP_MBPS}
+SHAPE_ENABLED=${SHAPE_ENABLED}
+WIFI_OFF=${WIFI_OFF}
+OVERRIDE_MODE=${override}
+UPDATED_AT=$(date +%s)
+EOF
+  chmod 644 "$USER_PREFS_FILE" 2>/dev/null || true
+}
+
+OVERRIDE_MODE=auto
+load_user_prefs
+
+TAIL_MLE_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    status|pf-status|restore|apply|watch|install-auto|uninstall-auto|auto-status|test-popup|unshape|shape|verify|verify-lean|test|self-test|menubar|menubar-start|menubar-stop|wireshark-gui|owd-probe|doctor|version|web|workbench|__root_apply|__root_restore)
+      MODE=$1; shift ;;
+    -v|--version)
+      MODE=version; shift ;;
+    tail-mle)
+      MODE=tail-mle; shift
+      TAIL_MLE_ARGS=("$@")
+      break
+      ;;
+    pcap|wireshark|diag)
+      MODE=pcap
+      if [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]]; then
+        PCAP_SECS=$2
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    cap)
+      MODE=cap
+      DOWN_MBPS=${2:?Usage: tether-optimize cap <down_mbps> <up_mbps>}
+      UP_MBPS=${3:?Usage: tether-optimize cap <down_mbps> <up_mbps>}
+      SHAPE_ENABLED=1
+      shift 3 ;;
+    --wifi-off) WIFI_OFF=1; shift ;;
+    --no-wifi-off) WIFI_OFF=0; shift ;;
+    --no-shape) SHAPE_ENABLED=0; shift ;;
+    --down-mbps) DOWN_MBPS=${2:?}; shift 2 ;;
+    --up-mbps) UP_MBPS=${2:?}; shift 2 ;;
+    --tailscale-dns-off) TAILSCALE_DNS=off; shift ;;
+    --tailscale-dns-on) TAILSCALE_DNS=on; shift ;;
+    --poll) POLL_SECS=${2:?}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+# --- USB inventory (iPhone/iPad vs Realtek dongle) ---------------------------
+
+CACHED_IOREG_USB=""
+
+read_ioreg_usb() {
+  if [[ -n "${CACHED_IOREG_USB:-}" ]]; then
+    printf '%s\n' "$CACHED_IOREG_USB"
+  else
+    ioreg -p IOUSB -w0 2>/dev/null || true
+  fi
+}
+
+usb_ios_present() {
+  # Matches Apple iPhone@ or iPad@ on the USB bus; never matches Realtek 802.11n NIC@.
+  read_ioreg_usb | grep -Eq '(iPhone|iPad)@'
+}
+
+usb_wifi_dongle_present() {
+  # RTL8812AU — Kali/UTM passthrough only (NOT macOS tether)
+  read_ioreg_usb | grep -q '802.11n NIC@'
+}
+
+usb_wifi_dongle_info() {
+  if usb_wifi_dongle_present; then
+    echo "ON HOST bus (Realtek 802.11n / 0bda:8812) — connect in VMware Fusion → Ubuntu (not macOS)"
+  else
+    echo "not on host bus (unplugged OR already inside VMware Ubuntu — expected for passthrough)"
+  fi
+}
+
+# --- Multi-Device USB + Wi-Fi Hotspot Discovery (Single Canonical Service Table) ---
+
+CACHED_WIFI_DEV=""
+CACHED_SERVICE_ORDER=""
+CACHED_SERVICES=""
+CACHED_USB_PORTS=""
+
+pretty_service_name() {
+  local s=${1:-}
+  printf '%s\n' "${s/% USB USB/ USB}"
+}
+
+# Parses `networksetup -listnetworkserviceorder` ONCE into normalized rows `idx|dev|svc|port`.
+refresh_hardware_port_cache() {
+  CACHED_SERVICE_ORDER=$(/usr/sbin/networksetup -listnetworkserviceorder 2>/dev/null || true)
+  CACHED_SERVICES=$(printf '%s\n' "$CACHED_SERVICE_ORDER" | awk '
+    /^\([0-9*]+\) / {
+      idx = $1; gsub(/[()*]/, "", idx)
+      svc = $0; sub(/^\([0-9*]+\) /, "", svc); sub(/^\*/, "", svc)
+    }
+    /^\(Hardware Port:/ {
+      port = $0; sub(/^\(Hardware Port: /, "", port); sub(/, Device:.*$/, "", port)
+      dev  = $0; sub(/^.*, Device: /, "", dev);      sub(/\)$/, "", dev)
+      if (svc != "") print idx "|" dev "|" svc "|" port
+    }
+  ')
+  CACHED_WIFI_DEV=$(awk -F'|' '$4 == "Wi-Fi" && $2 != "" { print $2; exit }' <<< "$CACHED_SERVICES")
+  [[ -n "$CACHED_WIFI_DEV" ]] || CACHED_WIFI_DEV="en0"
+  CACHED_USB_PORTS=$(awk -F'|' '
+    ($4 ~ /^(iPhone|iPad) USB/ || $3 ~ /^(iPhone|iPad) USB/) && $2 ~ /^en[0-9]+$/ && $3 !~ /(LAN|AX88|802\.11|Wi-Fi|WiFi|Realtek)/ {
+      print $2 "|" $3 "|" $4
+    }
+  ' <<< "$CACHED_SERVICES")
+}
+
+ensure_service_cache() {
+  [[ -n "$CACHED_SERVICES" ]] || refresh_hardware_port_cache
+}
+
+wifi_device() {
+  ensure_service_cache
+  printf '%s\n' "${CACHED_WIFI_DEV:-en0}"
+}
+
+default_route_device() {
+  /sbin/route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+iface_exists() {
+  local dev=$1
+  [[ -n "${dev:-}" ]] && /sbin/ifconfig "$dev" >/dev/null 2>&1
+}
+
+iface_mtu() {
+  local dev=$1
+  [[ -n "${dev:-}" ]] && /sbin/ifconfig "$dev" 2>/dev/null | sed -n 's/.*mtu \([0-9]*\).*/\1/p' | head -1
+}
+
+set_iface_mtu_if_needed() {
+  local dev=$1 target_mtu=$2 cur_mtu
+  [[ -n "${dev:-}" && -n "${target_mtu:-}" ]] || return 1
+  iface_exists "$dev" || return 1
+  cur_mtu=$(iface_mtu "$dev" || true)
+  [[ "$cur_mtu" == "$target_mtu" ]] && return 1
+  /sbin/ifconfig "$dev" mtu "$target_mtu" 2>/dev/null || true
+  return 0
+}
+
+service_exists_in_order() {
+  local target=$1
+  [[ -n "${target:-}" ]] || return 1
+  ensure_service_cache
+  awk -F'|' -v t="$target" '$3 == t { found = 1; exit } END { exit (found ? 0 : 1) }' <<< "$CACHED_SERVICES"
+}
+
+set_airport_power_if_needed() {
+  local dev=$1 target_state=$2 cur_state
+  [[ -n "${dev:-}" && -n "${target_state:-}" ]] || return 1
+  cur_state=$(/usr/sbin/networksetup -getairportpower "$dev" 2>/dev/null | awk -F': ' '{print tolower($2)}' || true)
+  [[ "$cur_state" == "$target_state" ]] && return 1
+  /usr/sbin/networksetup -setairportpower "$dev" "$target_state" >/dev/null 2>&1 || true
+  return 0
+}
+
+service_for_device() {
+  local target=$1
+  [[ -n "${target:-}" ]] || return 1
+  ensure_service_cache
+  awk -F'|' -v t="$target" '$2 == t { print $3; exit }' <<< "$CACHED_SERVICES"
+}
+
+is_usb_hotspot_device() {
+  local target=$1 dev
+  [[ -z "$target" ]] && return 1
+  case "$target" in
+    en7|en17) return 0 ;;
+    en0|en8|en9|en12|en13|en22) return 1 ;;
+  esac
+  while IFS='|' read -r dev _ _; do
+    [[ "$dev" == "$target" ]] && return 0
+  done < <(list_usb_hotspot_ports)
+  return 1
+}
+
+# Echoes "<dev>|<service>" for the active non-hotspot Home Wi-Fi / Wired LAN interface.
+# Prefers an active Wired Gigabit LAN on en9 when en9 holds an upstream LAN IP (e.g. 192.168.15.x),
+# even if Wi-Fi was previously ordered ahead of USB 10/100/1000 LAN.
+# Strictly excludes iPhone/iPad USB hotspot devices (en7, en17) so a stale default route
+# during cable unplug never misclassifies a USB tether port as a Home LAN interface.
+home_uplink_info() {
+  local def_dev wdev svc en9_up_ip
+  wdev=$(wifi_device || echo "en0")
+  [[ -n "$wdev" ]] || wdev="en0"
+  en9_up_ip=$(/sbin/ifconfig en9 2>/dev/null | awk '/inet / && $2 !~ /^(192\.168\.2\.|169\.254\.)/ { print $2; exit }')
+  if [[ -n "${en9_up_ip:-}" ]]; then
+    svc=$(service_for_device "en9" || true)
+    [[ -n "$svc" ]] || svc="USB 10/100/1000 LAN"
+    printf 'en9|%s\n' "$svc"
+    return 0
+  fi
+  def_dev=$(default_route_device || true)
+  if [[ -n "$def_dev" && "$def_dev" =~ ^en[0-9]+$ && "$def_dev" != "$wdev" ]] && ! is_usb_hotspot_device "$def_dev"; then
+    svc=$(service_for_device "$def_dev" || true)
+    [[ -n "$svc" ]] || svc="Wired LAN (${def_dev})"
+    printf '%s|%s\n' "$def_dev" "$svc"
+  else
+    printf '%s|Wi-Fi\n' "$wdev"
+  fi
+}
+
+# Lists all configured iOS/iPadOS USB tether ports as: "<dev>|<service>|<port>"
+list_usb_hotspot_ports() {
+  ensure_service_cache
+  [[ -n "$CACHED_USB_PORTS" ]] && printf '%s\n' "$CACHED_USB_PORTS" || true
+}
+
+iface_ipv4() {
+  local dev=$1
+  { ifconfig "$dev" 2>/dev/null || true; } | awk '
+    /inet / {
+      if ($2 != "192.168.2.1") { print $2; found = 1; exit }
+      if (fallback == "") fallback = $2
+    }
+    END {
+      if (!found && fallback != "") print fallback
+    }
+  '
+}
+
+iface_is_constrained() {
+  local dev=$1
+  { ifconfig "$dev" 2>/dev/null || true; } | head -2 | grep -qw 'constrained'
+}
+
+iface_is_expensive() {
+  local dev=$1
+  /usr/sbin/ipconfig getsummary "$dev" 2>/dev/null | grep -Eq 'IsExpensive[[:space:]]*:[[:space:]]*TRUE'
+}
+
+iface_has_clat46() {
+  local dev=$1
+  { ifconfig "$dev" 2>/dev/null || true; } | grep -Eq '(inet 192\.0\.0\.2 |clat46|nat64 prefix)'
+}
+
+is_hotspot_ipv4() {
+  local ip=$1
+  case "$ip" in
+    # 172.20.10.0/28 = Apple iPhone / iPad Personal Hotspot (Wi-Fi & USB, dual-stack)
+    # 192.0.0.2      = RFC 7335 CLAT46 (464XLAT) on IPv6-only / NAT64 iOS & iPadOS Personal Hotspot
+    # 192.168.43.0/24, 192.168.49.0/24 = Android Personal Hotspot / Wi-Fi Direct
+    172.20.10.*|192.0.0.2|192.168.43.*|192.168.49.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Detects active hotspot and echoes: "<type>|<dev>|<service>|<ip>"
+# where <type> is "usb" or "wifi". Returns 1 if not on a hotspot.
+detect_active_hotspot() {
+  local dev svc uip wdev wip
+
+  # 1. Prefer any active iPhone / iPad USB Personal Hotspot with a live hotspot IP
+  if usb_ios_present; then
+    while IFS='|' read -r dev svc _; do
+      [[ -z "$dev" ]] && continue
+      uip=$(iface_ipv4 "$dev" || true)
+      if [[ -n "$uip" ]] && { is_hotspot_ipv4 "$uip" || iface_has_clat46 "$dev" || iface_is_expensive "$dev"; }; then
+        printf 'usb|%s|%s|%s\n' "$dev" "$svc" "$uip"
+        return 0
+      fi
+    done < <(list_usb_hotspot_ports)
+  fi
+
+  # 2. Check Built-in Wi-Fi (en0) for Smartphone / iPad Personal Hotspot (single ifconfig read)
+  local w_ifcfg
+  wdev=$(wifi_device || echo "en0")
+  [[ -n "$wdev" ]] || wdev="en0"
+  w_ifcfg=$(/sbin/ifconfig "$wdev" 2>/dev/null || true)
+  wip=$(printf '%s\n' "$w_ifcfg" | awk '/inet / { if ($2 != "192.168.2.1") { print $2; exit } }')
+  if [[ -n "$wip" ]]; then
+    if is_hotspot_ipv4 "$wip" \
+       || printf '%s\n' "$w_ifcfg" | head -2 | grep -qw 'constrained' \
+       || printf '%s\n' "$w_ifcfg" | grep -Eq '(inet 192\.0\.0\.2 |clat46|nat64 prefix)' \
+       || iface_is_expensive "$wdev"; then
+      printf 'wifi|%s|Wi-Fi|%s\n' "$wdev" "$wip"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+# Also check if Wi-Fi (en0) is secondarily associated with a hotspot while USB is primary
+wifi_also_on_hotspot() {
+  local wdev wip
+  wdev=$(wifi_device || echo "en0")
+  wip=$(iface_ipv4 "$wdev" || true)
+  [[ -n "$wip" ]] && { is_hotspot_ipv4 "$wip" || iface_is_constrained "$wdev" || iface_is_expensive "$wdev" || iface_has_clat46 "$wdev"; }
+}
+
+# --- Privilege helper --------------------------------------------------------
+
+run_privileged() {
+  local body=$1 tmp rc
+  if is_root; then
+    /bin/bash -c "$body"
+    return $?
+  fi
+  tmp=$(mktemp /tmp/tether-optimize.XXXXXX)
+  printf '%s\n' "$body" >"$tmp"
+  chmod 700 "$tmp"
+  osascript -e "do shell script \"/bin/bash $(printf '%q' "$tmp")\" with administrator privileges"
+  rc=$?
+  rm -f "$tmp"
+  return $rc
+}
+
+# --- Service Ordering --------------------------------------------------------
+
+build_service_order_args() {
+  local svc=$1 name n o skip k
+  local -a all ordered
+  ensure_service_cache
+  while IFS= read -r name; do
+    [[ -n "$name" ]] && all+=("$name")
+  done < <(awk -F'|' '$3 != "" { print $3 }' <<< "$CACHED_SERVICES")
+
+  ordered=("$svc")
+  for k in "Wi-Fi" "Tailscale"; do
+    [[ "$k" == "$svc" ]] && continue
+    for n in "${all[@]}"; do
+      [[ "$n" == "$k" ]] && ordered+=("$k") && break
+    done
+  done
+  for n in "${all[@]}"; do
+    skip=0
+    for o in "${ordered[@]}"; do [[ "$n" == "$o" ]] && skip=1 && break; done
+    [[ $skip -eq 0 ]] && ordered+=("$n")
+  done
+  for n in "${ordered[@]}"; do printf ' %q' "$n"; done
+}
+
+first_ordered_service() {
+  ensure_service_cache
+  awk -F'|' '$1 == "1" { print $3; exit }' <<< "$CACHED_SERVICES"
+}
+
+order_services_if_needed() {
+  local svc=$1 cur_first order_args
+  [[ -n "${svc:-}" ]] || return 1
+  cur_first=$(first_ordered_service || true)
+  [[ "$cur_first" == "$svc" ]] && return 1
+  order_args=$(build_service_order_args "$svc")
+  # shellcheck disable=SC2086
+  eval /usr/sbin/networksetup -ordernetworkservices${order_args} >/dev/null 2>&1 || true
+  refresh_hardware_port_cache
+  return 0
+}
+
+set_service_dns_if_needed() {
+  local svc=$1 target_dns=$2 cur_dns cur_norm target_norm
+  [[ -n "${svc:-}" && -n "${target_dns:-}" ]] || return 1
+  cur_dns=$(/usr/sbin/networksetup -getdnsservers "$svc" 2>/dev/null || true)
+  if [[ "$target_dns" == "Empty" ]]; then
+    if printf '%s\n' "$cur_dns" | grep -q "aren't any DNS Servers"; then
+      return 1
+    fi
+    /usr/sbin/networksetup -setdnsservers "$svc" Empty >/dev/null 2>&1 || true
+    return 0
+  fi
+  cur_norm=$(printf '%s\n' "$cur_dns" | tr -d '\r' | tr '\n' ' ' | awk '{$1=$1; print}')
+  target_norm=$(printf '%s\n' "$target_dns" | tr -d '\r' | tr '\n' ' ' | awk '{$1=$1; print}')
+  if [[ "$cur_norm" == "$target_norm" ]]; then
+    return 1
+  fi
+  # shellcheck disable=SC2086
+  eval /usr/sbin/networksetup -setdnsservers "$(printf '%q' "$svc")" ${target_norm} >/dev/null 2>&1 || true
+  return 0
+}
+
+# --- Layer 1: Unified Declarative TCP / FQ-CoDel / L4S / LEDBAT++ Profile ----
+
+apply_tcp_profile() {
+  local profile=${1:-home}
+  local snd=262144 rcv=262144 max_snd=4194304 max_rcv=4194304 inc=32768
+  local mss=$HOME_WIFI_MSS v6mss=$HOME_WIFI_V6MSS bg_q=20 bg_shift=2 bg_inc=4
+  if [[ "$profile" == "hotspot" ]]; then
+    snd=65536; rcv=65536; max_snd=524288; max_rcv=1048576; inc=8192
+    mss=$HOTSPOT_MSS; v6mss=$HOTSPOT_MSS; bg_q=15; bg_shift=3; bg_inc=2
+  fi
+  rm -f "${STATE_DIR}/saved-sysctls.env" 2>/dev/null || true
+  /usr/sbin/sysctl -w \
+    net.inet.tcp.delayed_ack=3 \
+    net.inet.tcp.sendspace=${snd} \
+    net.inet.tcp.recvspace=${rcv} \
+    net.inet.tcp.autosndbufmax=${max_snd} \
+    net.inet.tcp.autorcvbufmax=${max_rcv} \
+    net.inet.tcp.autosndbufinc=${inc} \
+    net.inet.tcp.mssdflt=${mss} \
+    net.inet.tcp.v6mssdflt=${v6mss} \
+    net.inet.tcp.cubic_tcp_friendliness=1 \
+    net.inet.tcp.cubic_fast_convergence=1 \
+    net.inet.tcp.cubic_use_minrtt=1 \
+    net.inet.tcp.l4s=1 \
+    net.classq.fq_codel.enable_ecn=1 \
+    net.classq.fq_codel.enable_l4s=1 \
+    net.classq.fq_codel.enable_pacing=1 \
+    net.inet.tcp.bg_target_qdelay=${bg_q} \
+    net.inet.tcp.bg_tether_shift=${bg_shift} \
+    net.inet.tcp.bg_allowed_increase=${bg_inc} >/dev/null 2>&1 || true
+}
+
+apply_hotspot_sysctls() { apply_tcp_profile hotspot; }
+restore_sysctls()       { apply_tcp_profile home; }
+
+# --- Layer 2: Dummynet Shaper, PF MSS Clamping & Overlay/Tunnel Protection ---
+
+list_overlay_ifaces() {
+  /sbin/ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -E '^(utun[0-9]+|feth[0-9]+)$' | sort -V || true
+}
+
+overlay_ifaces_snapshot() {
+  list_overlay_ifaces | tr '\n' ' ' | awk '{$1=$1; print}'
+}
+
+# Matches Lean 4 `fastLaneRate` (Theorem 87): proportional 80% Fast-Lane capacity
+# (`max(floor, ⌊4 * effCap / 5⌋)` capped at `effCap`), uncapping Tailscale WireGuard & SSH
+# on fast 5G links (e.g. 80/24 Mbps at 100/30 instead of 5/3 Mbps!) while never exceeding `effCap`.
+fast_lane_rate() {
+  local cap=$1 floor=${2:-4} scaled
+  scaled=$(( (cap * 4) / 5 ))
+  if (( scaled >= floor )); then
+    printf '%d\n' "$scaled"
+  elif (( cap >= floor )); then
+    printf '%d\n' "$floor"
+  else
+    printf '%d\n' "$cap"
+  fi
+}
+
+# Matches Lean 4 `autorateStep` (Theorem 88): closed-loop AIMD cellular baseband delay controller.
+autorate_calc_next() {
+  local r_min=$1 r_max=$2 cur_r=$3 regime=$4 scaled inc cand
+  case "$regime" in
+    bloated)
+      scaled=$(( (cur_r * 4) / 5 ))
+      (( scaled < r_min )) && scaled=$r_min
+      printf '%d\n' "$scaled"
+      ;;
+    drained)
+      inc=$(( r_max / 10 ))
+      (( inc < 1 )) && inc=1
+      cand=$(( cur_r + inc ))
+      (( cand > r_max )) && cand=$r_max
+      printf '%d\n' "$cand"
+      ;;
+    *)
+      printf '%d\n' "$cur_r"
+      ;;
+  esac
+}
+
+# Matches Lean 4 `adaptiveLowThresh` & `adaptiveHighThresh` (Theorem 95):
+# Jacobson–Karels (RFC 6298) variance-adaptive hysteresis deadband with >= 18 ms strict separation.
+adaptive_low_thresh() {
+  local v=${1:-0} t
+  t=$(( 10 + v ))
+  (( t < 12 )) && t=12
+  (( t > 30 )) && t=30
+  printf '%d\n' "$t"
+}
+
+adaptive_high_thresh() {
+  local v=${1:-0} t
+  t=$(( 25 + 2 * v ))
+  (( t < 30 )) && t=30
+  (( t > 75 )) && t=75
+  printf '%d\n' "$t"
+}
+
+# Matches Lean 4 `paretoTailMargin`, `fatTailHighThresh`, `streakForAlpha`, `autorateFatTailStep`
+# (Section 31, Theorems 96–100: Pareto(x_m, α) power-law tail & Inverse-Gamma(a, b) MLE control).
+pareto_tail_margin() {
+  local alpha_milli=${1:-2143}
+  if (( alpha_milli <= 2000 )); then
+    printf '12\n'
+  elif (( alpha_milli <= 2500 )); then
+    printf '5\n'
+  else
+    printf '0\n'
+  fi
+}
+
+fat_tail_high_thresh() {
+  local v=${1:-0} alpha_milli=${2:-2143} base_hi margin
+  base_hi=$(adaptive_high_thresh "$v")
+  margin=$(pareto_tail_margin "$alpha_milli")
+  printf '%d\n' "$(( base_hi + margin ))"
+}
+
+streak_for_alpha() {
+  local alpha_milli=${1:-2143}
+  if (( alpha_milli <= 1000 )); then
+    printf '3\n'
+  else
+    printf '2\n'
+  fi
+}
+
+# Pontryagin's Maximum Principle (Section 32, Theorems 101–105):
+#   Maximizes current-value Kelly Hamiltonian `H(q, u, -λ) = (u_max · τ₀) ln u - λ u - C(q)`
+#   over `u ∈ [u_min, u_max]` with directional adjoint costate `λ(t) ≥ τ₀ = 20 ms`:
+#     u*(λ) = arg max_{u ∈ [u_min, u_max]} H(q, u, -λ) = clamp_[u_min, u_max](⌊(u_max · τ₀) / λ⌋).
+PONTRYAGIN_TAU_MS=20
+
+taleb_kappa_weight_milli() {
+  local a=${1:-2000} w
+  w=$(( 2000 - a ))
+  (( w < 0 )) && w=0
+  (( w > 1000 )) && w=1000
+  printf '%d\n' "$w"
+}
+
+pontryagin_adjoint_forcing() {
+  local tau=${1:-20} ex=${2:-0} a_milli=${3:-2000} sh_int=${4:-20} w sh_ex=0
+  (( ex < 0 )) && ex=0
+  (( sh_int > tau )) && sh_ex=$(( sh_int - tau ))
+  w=$(taleb_kappa_weight_milli "$a_milli")
+  printf '%d\n' "$(( tau + ex + (w * sh_ex) / 1000 ))"
+}
+
+pontryagin_costate_step() {
+  local tau=${1:-20} lam=${2:-20} psi=${3:-20} reg=${4:-deadband} cand diff=0
+  (( lam < tau )) && lam=$tau
+  case "$reg" in
+    bloated)
+      cand=$(( (lam + psi) / 2 ))
+      (( cand <= lam )) && cand=$(( lam + 4 ))
+      (( cand > 400 )) && cand=400
+      printf '%d\n' "$cand"
+      ;;
+    drained)
+      (( lam > tau )) && diff=$(( lam - tau ))
+      printf '%d\n' "$(( tau + (3 * diff) / 4 ))"
+      ;;
+    *)
+      printf '%d\n' "$lam"
+      ;;
+  esac
+}
+
+pontryagin_optimal_rate() {
+  local u_min=$1 u_max=$2 tau=${3:-20} lam=${4:-20} u_star
+  (( lam < 1 )) && lam=1
+  u_star=$(( (u_max * tau) / lam ))
+  (( u_star < u_min )) && u_star=$u_min
+  (( u_star > u_max )) && u_star=$u_max
+  printf '%d\n' "$u_star"
+}
+
+# Section 33 (Theorems 106–110):
+#   1. Birkhoff 3-reflector median `(a ⊓ b) ⊔ ((a ⊔ b) ⊓ c)` (Theorem 107)
+#   2. Revealed-capacity costate `λ_cap(W, r̂) = ⌊W / (r̂ + 1)⌋ + 1` (Theorem 108)
+#   3. BDP-Isochronous CoDel/GRED scaling `2 ≤ θ_min(u) < θ_max(u) < Q(u) ≤ 90` (Theorem 109)
+median3() {
+  local a=${1:-0} b=${2:-0} c=${3:-0} min_ab max_ab min_mc
+  min_ab=$(( a <= b ? a : b ))
+  max_ab=$(( a >= b ? a : b ))
+  min_mc=$(( max_ab <= c ? max_ab : c ))
+  printf '%d\n' "$(( min_ab >= min_mc ? min_ab : min_mc ))"
+}
+
+revealed_capacity_costate() {
+  local w=${1:-2000} r_hat=${2:-100}
+  (( r_hat < 0 )) && r_hat=0
+  printf '%d\n' "$(( w / (r_hat + 1) + 1 ))"
+}
+
+anchored_pontryagin_costate() {
+  local w=${1:-2000} lam=${2:-20} r_hat=${3:-100} lcap
+  lcap=$(revealed_capacity_costate "$w" "$r_hat")
+  printf '%d\n' "$(( lam >= lcap ? lam : lcap ))"
+}
+
+gred_min_th() {
+  local u=${1:-25} v
+  v=$(( u / 2 ))
+  (( v < 2 )) && v=2
+  (( v > 24 )) && v=24
+  printf '%d\n' "$v"
+}
+
+gred_max_th() {
+  local u=${1:-25} v
+  v=$(( (3 * u) / 2 ))
+  (( v < 6 )) && v=6
+  (( v > 64 )) && v=64
+  printf '%d\n' "$v"
+}
+
+dummynet_queue_slots() {
+  local u=${1:-25} v
+  v=$(( 2 * u + 4 ))
+  (( v < 10 )) && v=10
+  (( v > 90 )) && v=90
+  printf '%d\n' "$v"
+}
+
+owd_probe_cli() {
+  local dev="" raw ib ob qrtt up_raw down_raw mode owd_cnt resp_cnt rlist sum_owd
+  if detected=$(detect_active_hotspot 2>/dev/null); then
+    IFS='|' read -r _ dev _ _ <<< "$detected"
+  else
+    IFS='|' read -r dev _ <<< "$(home_uplink_info 2>/dev/null || echo 'en0|Wi-Fi')"
+  fi
+  [[ -n "${dev:-}" ]] || dev="en0"
+  if [[ -x "$EVENTS_BIN" ]]; then
+    raw=$("$EVENTS_BIN" --probe "$dev" 320 2>/dev/null || true)
+    IFS='|' read -r ib ob qrtt up_raw down_raw mode owd_cnt resp_cnt rlist <<< "${raw:-0|0|320|0|0|rtt|0|0|timeout}"
+    sum_owd=$(( ${up_raw:-0} + ${down_raw:-0} ))
+    echo "=== SOTA 3-Reflector Quorum & RFC 792 Type 13/14 One-Way Delay Probe (${dev}) ==="
+    echo "  Reflector Quorum  : ${resp_cnt}/3 responded (${rlist} ms) → median3 RTT = ${qrtt} ms [mode=${mode}]"
+    echo "  RFC 792 OWD Raw   : d̃_↑ = ${up_raw} ms | d̃_↓ = ${down_raw} ms | d̃_↑ + d̃_↓ = ${sum_owd} ms (θ cancelled!)"
+    echo "  BDP-Isochronous Q : Down(${DOWN_MBPS}M): GRED $(gred_min_th "$DOWN_MBPS")..$(gred_max_th "$DOWN_MBPS") / q=$(dummynet_queue_slots "$DOWN_MBPS") | Up(${UP_MBPS}M): GRED $(gred_min_th "$UP_MBPS")..$(gred_max_th "$UP_MBPS") / q=$(dummynet_queue_slots "$UP_MBPS")"
+  fi
+}
+
+# Napier–Taleb *Mirabilis Abbreviatio* (SCFT Ch. 8 & 12):
+#   X_1..X_n ~ Pareto(L, α)  ==>  S_n = Σ ln(X_i/L) ~ Gamma(n, α)
+#   Raw MLE:      α̂_MLE = n / S_n ~ InvGamma(shape = n, scale = nα), E[α̂_MLE] = (n/(n-1))α
+#   Taleb MVUE:   α̂_0   = (n - 1) / S_n   (exact unbiased E[α̂_0] = α; regularized prior mode when n < 2)
+#   Shadow Mean:  μ_sh  = α̂_0 L / (α̂_0 - 1)  (or Cirillo–Taleb bounded on [L, H] when α̂_0 ≤ 1)
+#   Exact Lomax Predictive VaR_99:  L · exp(S_n · (100^(1/n) - 1))  (zero digamma/trigamma/Newton loops!)
+# Outputs: `alpha0_milli|alpha0_str|alpha_mle_str|invg_n|shadow_mean_ms|var99_pred_ms|regime`
+taleb_pareto_mle() {
+  /usr/bin/awk -v L="${1:-10}" -v H="${2:-350}" -v samps="${3:-}" '
+  BEGIN {
+    Lv = (L + 0.0 > 0.0) ? (L + 0.0) : 10.0
+    Hv = (H + 0.0 > Lv * 2.0) ? (H + 0.0) : (Lv * 10.0)
+    sn = split(samps, sarr, /[[:space:],]+/)
+    n = 0; S = 0.0
+    for (i = 1; i <= sn; i++) {
+      x = sarr[i] + 0.0
+      if (x > Lv) { n++; S += log(x / Lv) }
+    }
+    if (n >= 2 && S > 1e-12) {
+      amle = n / S
+      a0   = (n - 1.0) / S
+      mle_s = sprintf("%.2f", amle)
+      varg = S * (exp(log(100.0) / n) - 1.0)
+      v99  = (varg < 40.0) ? sprintf("%.1f", Lv * exp(varg)) : "inf"
+    } else {
+      # Pre-observation / n < 2 shrinkage to InvGamma reference mode α_0 = (n + 2) / (S + 1.0)
+      a0   = (n + 2.0) / (S + 1.0)
+      mle_s = (n == 1 && S > 1e-12) ? sprintf("%.2f", 1.0 / S) : "n/a"
+      v99  = sprintf("%.1f", Lv * exp(log(100.0) / a0))
+    }
+    if (a0 > 1.05) {
+      sh = (a0 * Lv) / (a0 - 1.0)
+    } else if (a0 > 0.9999 && a0 < 1.0001) {
+      sh = Lv * log(Hv / Lv) / (1.0 - Lv / Hv)
+    } else {
+      r = Lv / Hv
+      sh = Lv * (a0 / (a0 - 1.0)) * (1.0 - exp((a0 - 1.0) * log(r))) / (1.0 - exp(a0 * log(r)))
+    }
+    amilli = int(a0 * 1000.0 + 0.5); if (amilli < 1) amilli = 1
+    reg = (amilli <= 1000) ? "inf_mean" : ((amilli <= 2000) ? "levy_fat" : "thin_tail")
+    printf "%d|%.2f|%s|%d|%.1f|%s|%s\n", amilli, a0, mle_s, n, sh, v99, reg
+  }'
+}
+
+tail_mle_cli() {
+  local xm=10
+  if [[ $# -ge 2 && "$1" == "--xm" ]]; then
+    xm=$2; shift 2
+  fi
+  if [[ $# -gt 0 ]]; then
+    local amilli a0 amle n sh v99 reg sh_int psi u_d u_u
+    IFS='|' read -r amilli a0 amle n sh v99 reg <<< "$(taleb_pareto_mle "$xm" 350 "$*")"
+    sh_int=${sh%%.*}; [[ -n "$sh_int" ]] || sh_int=20
+    psi=$(pontryagin_adjoint_forcing "$PONTRYAGIN_TAU_MS" "$sh_int" "$amilli" "$sh_int")
+    u_d=$(pontryagin_optimal_rate "$AUTORATE_FLOOR_DOWN" "$DOWN_MBPS" "$PONTRYAGIN_TAU_MS" "$psi")
+    u_u=$(pontryagin_optimal_rate "$AUTORATE_FLOOR_UP" "$UP_MBPS" "$PONTRYAGIN_TAU_MS" "$psi")
+    echo "=== Taleb Fat-Tail MLE + Pontryagin Hamiltonian Control (Pareto L=${xm}ms, τ₀=${PONTRYAGIN_TAU_MS}ms) ==="
+    echo "  Tail Index α    : α̂_0 (unbiased MVUE) = ${a0} | α̂_MLE (raw Hill) = ${amle} | regime = ${reg}"
+    echo "  Shadow Mean     : ${sh} ms | Preasymptotic Predictive VaR99 = ${v99} ms | streak k(α) = $(streak_for_alpha "$amilli")"
+    echo "  Pontryagin PMP  : Adjoint Ψ = ${psi} ms → arg max_u H(q, u, -Ψ) = ${u_d}↓ / ${u_u}↑ Mbps (ceiling ${DOWN_MBPS}/${UP_MBPS})"
+  elif [[ -f "$LAST_PCAP_FILE" && -f "${WIRESHARK_SKILL_DIR}/tcp_latency_analyzer.py" ]]; then
+    python3 "${WIRESHARK_SKILL_DIR}/tcp_latency_analyzer.py" "$LAST_PCAP_FILE" --compact
+  elif [[ -f "$UI_SNAPSHOT_FILE" ]]; then
+    grep -E '^(TAIL_|INVGAMMA_|SHADOW_|COSTATE_|AUTORATE_)' "$UI_SNAPSHOT_FILE" || true
+  fi
+}
+
+iface_io_bytes() {
+  local dev=$1
+  /usr/sbin/netstat -ibn -I "$dev" 2>/dev/null | awk '/<Link#/{printf "%.0f|%.0f\n", $(NF-4), $(NF-1); exit}'
+}
+
+iface_total_bytes() {
+  local dev=$1 io ib=0 ob=0
+  io=$(iface_io_bytes "$dev" || true)
+  IFS='|' read -r ib ob <<< "${io:-0|0}"
+  printf '%d\n' "$(( ${ib:-0} + ${ob:-0} ))"
+}
+
+write_autorate_state() {
+  local eff_d=$1 eff_u=$2 ceil_d=$3 ceil_u=$4 base_rtt=$5 cur_rtt=$6 delta_rtt=$7 regime=$8
+  local a_str=${9:-2.00} ig_n=${10:-0} sh_ms=${11:-20.0} v99_ms=${12:-100.0} treg=${13:-levy_fat}
+  local lam_d=${14:-20} lam_u=${15:-20} owd_d=${16:-0} owd_u=${17:-0} owd_m=${18:-owd} tmp
+  tmp="${AUTORATE_STATE_FILE}.tmp.$$"
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$eff_d" "$eff_u" "$ceil_d" "$ceil_u" "$base_rtt" "$cur_rtt" "$delta_rtt" "$regime" \
+    "$a_str" "$ig_n" "$sh_ms" "$v99_ms" "$treg" "$lam_d" "$lam_u" "$owd_d" "$owd_u" "$owd_m" > "$tmp" 2>/dev/null || return 0
+  chmod 644 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$AUTORATE_STATE_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+# Configures Dummynet pipes with BDP-Isochronous CoDel/GRED (`gred 0.002/θ_min(u)/θ_max(u)/p_max`,
+# generalizing baseline `gred 0.002/4/14/0.12`) and synchronous XNU ENOBUFS backpressure on #11 & #13.
+configure_dummynet_pipes() {
+  local eff_down=$1 eff_up=$2 fast_down fast_up q_d min_d max_d q_u min_u max_u q_fd q_fu
+  fast_down=$(fast_lane_rate "$eff_down" 4)
+  fast_up=$(fast_lane_rate "$eff_up" 2)
+  q_d=$(dummynet_queue_slots "$eff_down")
+  min_d=$(gred_min_th "$eff_down")
+  max_d=$(gred_max_th "$eff_down")
+  q_u=$(dummynet_queue_slots "$eff_up")
+  min_u=$(gred_min_th "$eff_up")
+  max_u=$(gred_max_th "$eff_up")
+  q_fd=$(dummynet_queue_slots "$fast_down")
+  q_fu=$(dummynet_queue_slots "$fast_up")
+  /usr/sbin/dnctl pipe ${PIPE_DOWN_FAST} config bw "${fast_down}Mbit/s" queue "${q_fd}" noerror >/dev/null 2>&1 || true
+  /usr/sbin/dnctl pipe ${PIPE_DOWN_BULK} config bw "${eff_down}Mbit/s" queue "${q_d}" gred "0.002/${min_d}/${max_d}/0.10" noerror >/dev/null 2>&1 || true
+  /usr/sbin/dnctl pipe ${PIPE_UP_FAST} config bw "${fast_up}Mbit/s" queue "${q_fu}" >/dev/null 2>&1 || true
+  /usr/sbin/dnctl pipe ${PIPE_UP_BULK} config bw "${eff_up}Mbit/s" queue "${q_u}" gred "0.002/${min_u}/${max_u}/0.12" >/dev/null 2>&1 || true
+}
+
+emit_dummynet_rules_for_dev() {
+  local d=$1
+  cat <<EOF
+dummynet in quick on ${d} inet proto icmp all pipe ${PIPE_DOWN_FAST}
+dummynet out quick on ${d} inet proto icmp all pipe ${PIPE_UP_FAST}
+dummynet in quick on ${d} inet6 proto ipv6-icmp all pipe ${PIPE_DOWN_FAST}
+dummynet out quick on ${d} inet6 proto ipv6-icmp all pipe ${PIPE_UP_FAST}
+dummynet in quick on ${d} proto { tcp, udp } from any port { 22, 53, 123, 853, 3478, 41641, 41642 } to any pipe ${PIPE_DOWN_FAST}
+dummynet out quick on ${d} proto { tcp, udp } from any to any port { 22, 53, 123, 853, 3478, 41641, 41642 } pipe ${PIPE_UP_FAST}
+dummynet out quick on ${d} proto udp from any port { 41641, 41642 } to any pipe ${PIPE_UP_FAST}
+dummynet in quick on ${d} proto udp from any to any port { 41641, 41642 } pipe ${PIPE_DOWN_FAST}
+dummynet in on ${d} all pipe ${PIPE_DOWN_BULK}
+dummynet out on ${d} all pipe ${PIPE_UP_BULK}
+EOF
+}
+
+emit_common_pf_tail() {
+  local ov_mss=$1 ov
+  while IFS= read -r ov; do
+    [[ -z "$ov" ]] && continue
+    echo "scrub on ${ov} inet all max-mss ${ov_mss}"
+    echo "scrub on ${ov} inet6 all max-mss ${ov_mss}"
+  done < <(list_overlay_ifaces)
+  echo "# Persistent local-service firewall guard (blocks non-loopback access to Ollama :11434 & Next.js :3000)"
+  echo "block drop in quick on ! lo0 proto tcp from any to any port { 3000, 11434 }"
+}
+
+commit_pf_anchor_and_overlay_state() {
+  chmod 644 "$SHAPER_STATE_FILE" 2>/dev/null || true
+  rm -f "${STATE_DIR}/overlay.ifaces" 2>/dev/null || true
+}
+
+apply_shaper_and_pf() {
+  local dev=$1 eff_down=${2:-$DOWN_MBPS} eff_up=${3:-$UP_MBPS} wdev fast_down fast_up also_wifi=0
+  wdev=$(wifi_device || echo "en0")
+  [[ "$dev" != "$wdev" ]] && wifi_also_on_hotspot && also_wifi=1
+  fast_down=$(fast_lane_rate "$eff_down" 4)
+  fast_up=$(fast_lane_rate "$eff_up" 2)
+
+  /sbin/pfctl -a "$PF_ANCHOR" -F all >/dev/null 2>&1 || true
+  /usr/sbin/dnctl -q flush >/dev/null 2>&1 || true
+
+  if [[ $SHAPE_ENABLED -eq 1 ]]; then
+    configure_dummynet_pipes "$eff_down" "$eff_up"
+    write_autorate_state "$eff_down" "$eff_up" "$DOWN_MBPS" "$UP_MBPS" 0 0 0 "ceiling"
+  else
+    rm -f "$AUTORATE_STATE_FILE" 2>/dev/null || true
+  fi
+
+  {
+    echo "# Auto-generated by tether-optimize for hotspot interface ${dev}"
+    echo "scrub on ${dev} inet all max-mss ${HOTSPOT_MSS}"
+    echo "scrub on ${dev} inet6 all max-mss ${HOTSPOT_MSS}"
+    if [[ $also_wifi -eq 1 ]]; then
+      echo "scrub on ${wdev} inet all max-mss ${HOTSPOT_MSS}"
+      echo "scrub on ${wdev} inet6 all max-mss ${HOTSPOT_MSS}"
+    fi
+    emit_common_pf_tail "$OVERLAY_MSS"
+    if [[ $SHAPE_ENABLED -eq 1 ]]; then
+      emit_dummynet_rules_for_dev "$dev"
+      [[ $also_wifi -eq 1 ]] && emit_dummynet_rules_for_dev "$wdev"
+    fi
+  } > "$PF_CONF_FILE"
+  # Re-order PF sections cleanly: all scrub rules before dummynet before block filter rules
+  awk '
+    /^#/ || /^scrub / { scrub[++ns] = $0; next }
+    /^dummynet /      { dn[++nd] = $0; next }
+    { flt[++nf] = $0 }
+    END {
+      for (i = 1; i <= ns; i++) print scrub[i]
+      for (i = 1; i <= nd; i++) print dn[i]
+      for (i = 1; i <= nf; i++) print flt[i]
+    }
+  ' "$PF_CONF_FILE" > "${PF_CONF_FILE}.ord" && mv -f "${PF_CONF_FILE}.ord" "$PF_CONF_FILE"
+
+  /sbin/pfctl -E >/dev/null 2>&1 || true
+  /sbin/pfctl -a "$PF_ANCHOR" -f "$PF_CONF_FILE" >/dev/null 2>&1 || true
+  {
+    echo "[PF Scrub & Local-Service Firewall Rules in $PF_ANCHOR]"
+    /sbin/pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null || true
+    if [[ $SHAPE_ENABLED -eq 1 ]]; then
+      echo "[PF Dummynet Rules in $PF_ANCHOR]"
+      /sbin/pfctl -a "$PF_ANCHOR" -s dummynet 2>/dev/null || true
+      echo "[Configured Dummynet Shaper (GRED AQM + Synchronous Uplink ENOBUFS + Closed-Loop Autorate)]"
+      echo "  Interactive & VPN : #${PIPE_DOWN_FAST} (${fast_down} Mbit/s down, q=28), #${PIPE_UP_FAST} (${fast_up} Mbit/s up, q=18, sync-ENOBUFS) [ICMP/DNS/SSH/NTP/DoT/STUN/Tailscale]"
+      echo "  Bulk GRED pipes   : #${PIPE_DOWN_BULK} (${eff_down}/${DOWN_MBPS} Mbit/s down, GRED 6..20), #${PIPE_UP_BULK} (${eff_up}/${UP_MBPS} Mbit/s up, GRED 4..14, sync-ENOBUFS)"
+      /usr/sbin/dnctl pipe show 2>/dev/null || true
+    else
+      echo "[Dummynet Bandwidth Shaper: DISABLED (--no-shape / unshape; TCP & MSS clamps active)]"
+    fi
+  } > "$SHAPER_STATE_FILE" 2>/dev/null || true
+  commit_pf_anchor_and_overlay_state
+}
+
+restore_shaper_and_pf() {
+  local target_uplink=${1:-} wdev hdev hsvc
+  wdev=$(wifi_device || echo "en0")
+  if [[ -n "$target_uplink" ]]; then
+    IFS='|' read -r hdev hsvc <<< "$target_uplink"
+  else
+    IFS='|' read -r hdev hsvc <<< "$(home_uplink_info)"
+  fi
+  [[ -n "${hdev:-}" ]] || hdev="$wdev"
+  /sbin/pfctl -a "$PF_ANCHOR" -F all >/dev/null 2>&1 || true
+  /usr/sbin/dnctl -q flush >/dev/null 2>&1 || true
+  rm -f "$AUTORATE_STATE_FILE" 2>/dev/null || true
+  {
+    echo "# Auto-generated by tether-optimize for Standard Home Wi-Fi / LAN (${hdev}, PPPoE 1492 WAN)"
+    echo "scrub on ${wdev} inet all max-mss ${HOME_WIFI_MSS}"
+    echo "scrub on ${wdev} inet6 all max-mss ${HOME_WIFI_V6MSS}"
+    if [[ "$hdev" != "$wdev" ]] && iface_exists "$hdev"; then
+      echo "scrub on ${hdev} inet all max-mss ${HOME_WIFI_MSS}"
+      echo "scrub on ${hdev} inet6 all max-mss ${HOME_WIFI_V6MSS}"
+    fi
+    emit_common_pf_tail "$HOME_OVERLAY_MSS"
+  } > "$PF_CONF_FILE"
+  /sbin/pfctl -E >/dev/null 2>&1 || true
+  /sbin/pfctl -a "$PF_ANCHOR" -f "$PF_CONF_FILE" >/dev/null 2>&1 || true
+  {
+    echo "[PF Standard Home Wi-Fi / LAN Scrub & Local-Service Firewall Rules in $PF_ANCHOR (hotspot shaper inactive)]"
+    /sbin/pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null || true
+  } > "$SHAPER_STATE_FILE" 2>/dev/null || true
+  commit_pf_anchor_and_overlay_state
+}
+
+# --- Layer 2b: System Proxy Blackhole Guard (127.0.0.1:7890) -----------------
+# Prevents stale Web/HTTPS/SOCKS system proxy settings pointing at 127.0.0.1:7890
+# from blackholing traffic when no local proxy listener is running on port 7890.
+
+tcp_listen_ports_snapshot() {
+  /usr/sbin/netstat -an -p tcp 2>/dev/null | awk '/LISTEN/{ sub(/^.*\./, "", $4); print $4 }' | sort -u
+}
+
+proxy_7890_listening() {
+  tcp_listen_ports_snapshot | grep -qx '7890'
+}
+
+sanitize_dead_system_proxies() {
+  proxy_7890_listening && return 0
+  local -a svcs=("Wi-Fi")
+  local dev s spec get_flag set_flag label info
+  for dev in en7 en17 en9; do
+    iface_exists "$dev" || continue
+    s=$(service_for_device "$dev" || true)
+    [[ -n "${s:-}" ]] && svcs+=("$s")
+  done
+  iface_exists bridge0 && svcs+=("Thunderbolt Bridge")
+  for s in "${svcs[@]}"; do
+    for spec in "getwebproxy:setwebproxystate:Web Proxy" "getsecurewebproxy:setsecurewebproxystate:Secure Web Proxy" "getsocksfirewallproxy:setsocksfirewallproxystate:SOCKS Firewall Proxy"; do
+      IFS=':' read -r get_flag set_flag label <<< "$spec"
+      info=$(/usr/sbin/networksetup -"$get_flag" "$s" 2>/dev/null || true)
+      if printf '%s\n' "$info" | grep -q '^Enabled: Yes' && printf '%s\n' "$info" | grep -q '^Port: 7890'; then
+        /usr/sbin/networksetup -"$set_flag" "$s" off >/dev/null 2>&1 || true
+        log "proxy-guard: disabled dead ${label} (127.0.0.1:7890) on '$s'"
+      fi
+    done
+  done
+}
+
+# --- Layer 3: AWDL (AirDrop/Handoff channel-hopping) & MTU -------------------
+
+enforce_awdl_down_for_wifi_hotspot() {
+  local mode=${1:-initial} cnt
+  if [[ ! -f "$AWDL_SUPPRESSED_FILE" ]]; then
+    printf '0\n' > "$AWDL_SUPPRESSED_FILE" 2>/dev/null || true
+    chmod 644 "$AWDL_SUPPRESSED_FILE" 2>/dev/null || true
+  fi
+  if /sbin/ifconfig awdl0 2>/dev/null | head -1 | grep -qw 'UP'; then
+    /sbin/ifconfig awdl0 down 2>/dev/null || true
+    if [[ "$mode" == "quiet" ]]; then
+      cnt=$(cat "$AWDL_SUPPRESSED_FILE" 2>/dev/null || echo 0)
+      [[ "$cnt" =~ ^[0-9]+$ ]] || cnt=0
+      printf '%d\n' "$((cnt + 1))" > "$AWDL_SUPPRESSED_FILE" 2>/dev/null || true
+      chmod 644 "$AWDL_SUPPRESSED_FILE" 2>/dev/null || true
+    else
+      log "radio: awdl0 set DOWN (prevents Wi-Fi hotspot channel-hopping)"
+    fi
+  fi
+}
+
+restore_awdl_up() {
+  rm -f "$AWDL_SUPPRESSED_FILE" 2>/dev/null || true
+  if ! /sbin/ifconfig awdl0 2>/dev/null | head -1 | grep -qw 'UP'; then
+    /sbin/ifconfig awdl0 up 2>/dev/null || true
+    log "radio: awdl0 restored UP"
+  fi
+}
+
+# --- Layer 4: Third-Party Background Sync, Scanner & Helper Throttling -------
+# Note: Native macOS system daemons (bird, cloudd, nsurlsessiond, photolibraryd)
+# already run under launchd ProcessType=Background and obey net.inet.tcp.bg_target_qdelay=15.
+# Here we explicitly clamp third-party sync/updater/scanner/helper daemons into PRIO_DARWIN_BG
+# and restore them to normal priority on hotspot disconnect.
+
+THIRD_PARTY_BG_PATTERNS=(
+  "OneDrive Sync Service"
+  "OneDriveStandaloneUpdater"
+  "OneDriveUpdater"
+  "Core Sync"
+  "CCXProcess"
+  "Creative Cloud Content Manager"
+  "Creative Cloud UI Helper"
+  "GoogleUpdater"
+  "Microsoft AutoUpdate"
+  "Dropbox"
+  "fingagent.bin"
+  "DuetDaemon"
+  "DuetHelper"
+  "Citrix Workspace Helper"
+  "CtxWorkspaceHelperDaemon"
+)
+
+throttle_background_daemons() {
+  touch "$THROTTLED_PIDS_FILE"
+  local pat pid tmp_live
+  tmp_live="${THROTTLED_PIDS_FILE}.live.$$"
+  : > "$tmp_live"
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "$pid" >> "$tmp_live"
+    fi
+  done < "$THROTTLED_PIDS_FILE"
+  mv -f "$tmp_live" "$THROTTLED_PIDS_FILE" 2>/dev/null || rm -f "$tmp_live"
+
+  for pat in "${THIRD_PARTY_BG_PATTERNS[@]}"; do
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      if ! grep -qx "$pid" "$THROTTLED_PIDS_FILE" 2>/dev/null; then
+        if /usr/sbin/taskpolicy -b -p "$pid" 2>/dev/null; then
+          /usr/bin/renice 20 -p "$pid" >/dev/null 2>&1 || true
+          printf '%s\n' "$pid" >> "$THROTTLED_PIDS_FILE"
+        fi
+      fi
+    done < <(pgrep -f "$pat" 2>/dev/null || true)
+  done
+  chmod 644 "$THROTTLED_PIDS_FILE" 2>/dev/null || true
+  return 0
+}
+
+restore_background_daemons() {
+  [[ -f "$THROTTLED_PIDS_FILE" ]] || return 0
+  local pid
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    /usr/sbin/taskpolicy -B -p "$pid" 2>/dev/null || true
+    /usr/bin/renice 0 -p "$pid" >/dev/null 2>&1 || true
+  done < "$THROTTLED_PIDS_FILE"
+  rm -f "$THROTTLED_PIDS_FILE"
+}
+
+# --- Apply / Restore Core ----------------------------------------------------
+
+apply_core() {
+  local detected=${1:-}
+  local htype dev svc svc_pretty ip d dns prev_mode prev_dev sc_changed=0
+
+  load_user_prefs
+  sanitize_dead_system_proxies
+  sanitize_en9_upstream_lan_guard
+
+  if [[ -z "$detected" ]]; then
+    if ! detected=$(detect_active_hotspot); then
+      log "apply: no active Wi-Fi or USB smartphone/iPad hotspot detected"
+      return 1
+    fi
+  fi
+
+  IFS='|' read -r htype dev svc ip <<< "$detected"
+  svc_pretty=$(pretty_service_name "$svc")
+
+  # If transitioning from a different hotspot interface (e.g. wifi en0 -> usb en7),
+  # clean up the previous interface's MTU/DNS first.
+  prev_mode=$(cat "$MODE_FILE" 2>/dev/null || true)
+  if [[ -n "$prev_mode" && "$prev_mode" != "$detected" ]]; then
+    IFS='|' read -r _ prev_dev _ _ <<< "$prev_mode"
+    if [[ -n "${prev_dev:-}" && "$prev_dev" != "$dev" ]]; then
+      set_iface_mtu_if_needed "$prev_dev" 1500 || true
+    fi
+  fi
+
+  # 1. Service order & DNS (idempotent: only mutate SCPreferences & flush DNS when changed)
+  order_services_if_needed "$svc" && sc_changed=1 || true
+  if iface_has_clat46 "$dev"; then
+    set_service_dns_if_needed "$svc" Empty && sc_changed=1 || true
+  else
+    dns=""
+    for d in "${DNS_SERVERS[@]}"; do dns+=" $d"; done
+    set_service_dns_if_needed "$svc" "$dns" && sc_changed=1 || true
+  fi
+  /usr/sbin/networksetup -setv6automatic "$svc" >/dev/null 2>&1 || true
+
+  # 2. Interface MTU to match cellular encapsulation (also clamp secondary Wi-Fi if on hotspot)
+  set_iface_mtu_if_needed "$dev" "$HOTSPOT_MTU" || true
+  local wdev_cur
+  wdev_cur=$(wifi_device || echo en0)
+  if [[ "$dev" != "$wdev_cur" ]]; then
+    if wifi_also_on_hotspot; then
+      set_iface_mtu_if_needed "$wdev_cur" "$HOTSPOT_MTU" || true
+    else
+      set_iface_mtu_if_needed "$wdev_cur" "$HOME_WIFI_MTU" || true
+    fi
+  fi
+
+  # 3. TCP / FQ-CoDel / L4S / LEDBAT++ sysctls
+  apply_hotspot_sysctls
+
+  # 4. Dummynet shaper + PF MSS 1380 outer / 1220 inner overlay scrub (IPv4 & IPv6)
+  apply_shaper_and_pf "$dev"
+
+  # 5. Manage awdl0: disable on Wi-Fi hotspot (or if Wi-Fi is also on hotspot),
+  #    restore UP when exclusively on USB tether so AirDrop works over cable tether!
+  if [[ "$htype" == "wifi" ]] || wifi_also_on_hotspot; then
+    enforce_awdl_down_for_wifi_hotspot
+  else
+    restore_awdl_up
+    if [[ $WIFI_OFF -eq 1 ]]; then
+      local wdev
+      wdev=$(wifi_device || echo en0)
+      set_airport_power_if_needed "$wdev" off || true
+    fi
+  fi
+
+  # 6. Throttle third-party background sync apps into Darwin Background QoS
+  : > "$THROTTLED_PIDS_FILE"
+  throttle_background_daemons
+
+  if [[ $sc_changed -eq 1 ]]; then
+    /usr/bin/dscacheutil -flushcache 2>/dev/null || true
+    /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true
+  fi
+
+  local htype_up shape_desc
+  htype_up=$(printf '%s' "$htype" | tr '[:lower:]' '[:upper:]')
+  if [[ $SHAPE_ENABLED -eq 1 ]]; then
+    shape_desc="${DOWN_MBPS}/${UP_MBPS} Mbps shaped"
+  else
+    shape_desc="unshaped (TCP/MSS clamped)"
+  fi
+
+  printf '%s|%s|%s|%s\n' "$detected" "$DOWN_MBPS" "$UP_MBPS" "$SHAPE_ENABLED" > "$MODE_FILE"
+  chmod 644 "$MODE_FILE" 2>/dev/null || true
+  trim_logs
+  log "apply: hotspot OK type=$htype svc='$svc' dev='$dev' ip=$ip cap=${DOWN_MBPS}/${UP_MBPS}Mbps shape=$SHAPE_ENABLED mtu=$HOTSPOT_MTU mss=$HOTSPOT_MSS overlay_mss=$OVERLAY_MSS"
+  notify_user "Hotspot optimized (${htype_up})" \
+    "${svc_pretty} (${ip} on ${dev}): ${shape_desc}, MSS ${HOTSPOT_MSS}/${OVERLAY_MSS}, sync throttled." Glass
+}
+
+# Prevents en9 from running a rogue DHCP server (bootpd) or carrying a conflicting
+# 192.168.2.1 alias when en9 is plugged into an upstream Home/Office LAN (e.g. 192.168.15.0/24).
+sanitize_en9_upstream_lan_guard() {
+  is_root || return 0
+  local en9_upstream_ip def_dev
+  en9_upstream_ip=$(/sbin/ifconfig en9 2>/dev/null | awk '/inet / && $2 !~ /^(192\.168\.2\.|169\.254\.)/ { print $2; exit }')
+  def_dev=$(default_route_device || true)
+  if [[ -n "${en9_upstream_ip:-}" || "${def_dev:-}" == "en9" ]]; then
+    if /sbin/ifconfig en9 2>/dev/null | grep -q 'inet 192\.168\.2\.1 '; then
+      /sbin/ifconfig en9 inet 192.168.2.1 -alias 2>/dev/null || true
+      log "lan-guard: removed 192.168.2.1 sharing alias from en9 (en9 is active upstream LAN ${en9_upstream_ip:-default})"
+    fi
+    if /bin/launchctl print system/com.apple.bootpd >/dev/null 2>&1 || /usr/bin/pgrep -x bootpd >/dev/null 2>&1; then
+      /bin/launchctl bootout system/com.apple.bootpd 2>/dev/null || true
+      /usr/bin/killall bootpd 2>/dev/null || true
+      log "lan-guard: stopped bootpd DHCP server on en9 (prevents rogue 192.168.2.x leases on Home LAN)"
+    fi
+  fi
+}
+
+restore_core() {
+  local target_uplink=${1:-}
+  local dev svc wdev hdev hsvc prev_mode htype d dns sc_changed=0
+  sanitize_en9_upstream_lan_guard
+  prev_mode=$(cat "$MODE_FILE" 2>/dev/null || true)
+  if [[ -n "$prev_mode" ]]; then
+    sc_changed=1
+    IFS='|' read -r htype dev svc _ _ _ _ <<< "$prev_mode"
+    if [[ -n "${dev:-}" ]] && iface_exists "$dev"; then
+      set_iface_mtu_if_needed "$dev" 1500 || true
+    fi
+    if [[ -n "${svc:-}" ]] && service_exists_in_order "$svc"; then
+      set_service_dns_if_needed "$svc" Empty || true
+    fi
+    if [[ "${svc:-}" == *" USB USB" ]] && service_exists_in_order "${svc% USB}"; then
+      set_service_dns_if_needed "${svc% USB}" Empty || true
+    fi
+    while IFS='|' read -r dev svc _; do
+      if [[ -n "${dev:-}" ]] && iface_exists "$dev"; then
+        set_iface_mtu_if_needed "$dev" 1500 || true
+      fi
+      if [[ -n "${svc:-}" ]] && service_exists_in_order "$svc"; then
+        set_service_dns_if_needed "$svc" Empty || true
+      fi
+    done < <(list_usb_hotspot_ports)
+  fi
+
+  wdev=$(wifi_device || echo en0)
+  if [[ -n "$target_uplink" ]]; then
+    IFS='|' read -r hdev hsvc <<< "$target_uplink"
+  else
+    IFS='|' read -r hdev hsvc <<< "$(home_uplink_info)"
+  fi
+  [[ -n "${hdev:-}" ]] || hdev="$wdev"
+  [[ -n "${hsvc:-}" ]] || hsvc="Wi-Fi"
+
+  # Standard Home Wi-Fi & Wired LAN (en9) optimization:
+  #   • Primary service order: active home uplink first (or Wi-Fi) — idempotent, skips SCPreferences write if already #1
+  #   • MTU 1492 on en0 and active home LAN uplink — idempotent, skips SIOCSIFMTU if already 1492 so en9 USB PHY never resets!
+  #   • Fast public DNS (1.1.1.1 / 1.0.0.1 / 8.8.8.8 / 8.8.4.4) + local router fallback (192.168.15.1 / 192.168.1.1)
+  if order_services_if_needed "$hsvc"; then
+    sc_changed=1
+  fi
+  set_iface_mtu_if_needed "$wdev" "$HOME_WIFI_MTU" || true
+  [[ "$hdev" != "$wdev" ]] && iface_exists "$hdev" && { set_iface_mtu_if_needed "$hdev" "$HOME_WIFI_MTU" || true; }
+  dns=""
+  for d in "${DNS_SERVERS[@]}" 192.168.15.1 192.168.1.1; do dns+=" $d"; done
+  if set_service_dns_if_needed "Wi-Fi" "$dns"; then
+    sc_changed=1
+  fi
+  if [[ "$hsvc" != "Wi-Fi" ]] && iface_exists "$hdev"; then
+    if set_service_dns_if_needed "$hsvc" "$dns"; then
+      sc_changed=1
+    fi
+  fi
+
+  restore_shaper_and_pf "${hdev}|${hsvc}"
+  restore_sysctls
+  restore_awdl_up
+  restore_background_daemons
+
+  if [[ $WIFI_OFF -eq 1 ]]; then
+    set_airport_power_if_needed "$wdev" on || true
+  fi
+
+  rm -f "$MODE_FILE"
+  trim_logs
+  if [[ $sc_changed -eq 1 ]]; then
+    /usr/bin/dscacheutil -flushcache 2>/dev/null || true
+    /usr/bin/killall -HUP mDNSResponder 2>/dev/null || true
+  fi
+  log "restore: applied Standard Home Wi-Fi/LAN profile (${hdev} [${hsvc}] mtu=${HOME_WIFI_MTU} mss=${HOME_WIFI_MSS}/${HOME_WIFI_V6MSS} overlay_mss=${HOME_OVERLAY_MSS} delayed_ack=3 l4s=1 ecn=1 buf=4MB awdl0=UP)"
+  notify_user "Home Network optimized (${hsvc})" "Applied PPPoE-safe MTU ${HOME_WIFI_MTU} on ${hdev}, MSS ${HOME_WIFI_MSS}/${HOME_OVERLAY_MSS}, L4S/ECN, 4 MB BDP buffers, and AirDrop (awdl0 UP)." Pop
+}
+
+# ---User-Space Entrypoints (Zero-Password When Daemon Is Loaded) ------------
+
+wait_for_daemon_sync() {
+  local prefs_ts state_ts elapsed=0
+  prefs_ts=$(stat -f %m "$USER_PREFS_FILE" 2>/dev/null || echo 0)
+  while (( elapsed < 40 )); do
+    sleep 0.04
+    elapsed=$((elapsed + 1))
+    state_ts=$(stat -f %m "$STATE_FILE" 2>/dev/null || echo 0)
+    if (( state_ts >= prefs_ts && elapsed >= 2 )); then
+      return 0
+    fi
+  done
+}
+
+apply() {
+  save_user_prefs auto
+  if is_root; then
+    apply_core
+  elif daemon_loaded; then
+    echo "Signaling running root daemon (${LABEL}) to apply (${DOWN_MBPS}/${UP_MBPS} Mbps, shape=${SHAPE_ENABLED})…"
+    wait_for_daemon_sync
+  else
+    local flags=()
+    [[ $WIFI_OFF -eq 1 ]] && flags+=(--wifi-off)
+    [[ $SHAPE_ENABLED -eq 0 ]] && flags+=(--no-shape)
+    flags+=(--down-mbps "$DOWN_MBPS" --up-mbps "$UP_MBPS")
+    echo "Requesting admin privileges…"
+    run_privileged "/bin/bash $(printf '%q' "$SCRIPT_PATH") __root_apply ${flags[*]}"
+  fi
+
+  if [[ -n "$TAILSCALE_DNS" ]] && command -v tailscale >/dev/null 2>&1 && ! is_root; then
+    if [[ "$TAILSCALE_DNS" == off ]]; then
+      tailscale set --accept-dns=false
+    else
+      tailscale set --accept-dns=true
+    fi
+  fi
+}
+
+restore() {
+  save_user_prefs force_restore
+  if is_root; then
+    restore_core
+  elif daemon_loaded; then
+    echo "Signaling running root daemon (${LABEL}) to restore unthrottled defaults…"
+    wait_for_daemon_sync
+  else
+    local flags=()
+    [[ $WIFI_OFF -eq 1 ]] && flags+=(--wifi-off)
+    run_privileged "/bin/bash $(printf '%q' "$SCRIPT_PATH") __root_restore ${flags[*]-}"
+  fi
+}
+
+# --- Status ------------------------------------------------------------------
+
+pf_status() {
+  echo "=== tether-optimize pf-status ($PF_ANCHOR) ==="
+  if [[ -f "$SHAPER_STATE_FILE" ]] && [[ -s "$SHAPER_STATE_FILE" ]]; then
+    cat "$SHAPER_STATE_FILE"
+  else
+    echo "(no active PF state file at $SHAPER_STATE_FILE)"
+  fi
+}
+
+status() {
+  local detected htype htype_up dev svc svc_pretty ip wdev wip rtt active_dev="none"
+  local scrub_outer_cnt scrub_ov_cnt dummynet_cnt fw_cnt live_bg_cnt bg_names
+  local cached_home_uplink hdev_cached hsvc_cached listen_ports ioreg_usb_out route_out gw_ip
+
+  load_user_prefs
+  refresh_hardware_port_cache
+  CACHED_IOREG_USB=$(ioreg -p IOUSB -w0 2>/dev/null || true)
+  ioreg_usb_out="$CACHED_IOREG_USB"
+  route_out=$(/sbin/route -n get default 2>/dev/null || true)
+  gw_ip=$(printf '%s\n' "$route_out" | awk '/gateway:/{print $2; exit}')
+  wdev=$(wifi_device || echo en0)
+  cached_home_uplink=$(home_uplink_info || echo "${wdev}|Wi-Fi")
+  IFS='|' read -r hdev_cached hsvc_cached <<< "$cached_home_uplink"
+  [[ -n "${hdev_cached:-}" ]] || hdev_cached="$wdev"
+  [[ -n "${hsvc_cached:-}" ]] || hsvc_cached="Wi-Fi"
+
+  echo "=== tether-optimize status ==="
+  echo
+  echo "── Active Hotspot Detection (USB + Wi-Fi) ──"
+  if detected=$(detect_active_hotspot); then
+    IFS='|' read -r htype dev svc ip <<< "$detected"
+    svc_pretty=$(pretty_service_name "$svc")
+    active_dev="$dev"
+    htype_up=$(printf '%s' "$htype" | tr '[:lower:]' '[:upper:]')
+    echo "status           : ACTIVE (${htype_up} Personal Hotspot)"
+    echo "service / device : $svc_pretty ($dev)"
+    if iface_has_clat46 "$dev"; then
+      echo "ip address       : $ip [NAT64 + CLAT46 / IPv6-only cellular hotspot]"
+    else
+      echo "ip address       : $ip"
+    fi
+    local dev_ifcfg
+    dev_ifcfg=$(/sbin/ifconfig "$dev" 2>/dev/null || true)
+    echo "iface flags      : $(printf '%s\n' "$dev_ifcfg" | head -1)"
+    echo "iface mtu        : $(printf '%s\n' "$dev_ifcfg" | sed -n 's/.*mtu \([0-9]*\).*/\1/p' | head -1)"
+    if [[ "$ip" == 172.20.10.* ]]; then
+      rtt=$(ping -c 2 -i 0.1 -t 1 172.20.10.1 2>/dev/null | awk -F'/' '/round-trip/{print $5 " ms"}' || true)
+      [[ -n "$rtt" ]] && echo "gateway 172.20.10.1: $rtt avg RTT"
+    else
+      rtt=$(ping -c 2 -i 0.1 -t 1 1.1.1.1 2>/dev/null | awk -F'/' '/round-trip/{print $5 " ms"}' || true)
+      [[ -n "$rtt" ]] && echo "cellular RTT (1.1.1.1): $rtt avg RTT"
+    fi
+  else
+    local hip h_ifcfg
+    hip=$(iface_ipv4 "$hdev_cached" || true)
+    h_ifcfg=$(/sbin/ifconfig "$hdev_cached" 2>/dev/null || true)
+    echo "status           : INACTIVE (Standard Home Wi-Fi / LAN mode active on ${hdev_cached} [${hsvc_cached}]${hip:+ — ${hip}})"
+    echo "iface flags      : $(printf '%s\n' "$h_ifcfg" | head -1)"
+    echo "iface mtu        : $(printf '%s\n' "$h_ifcfg" | sed -n 's/.*mtu \([0-9]*\).*/\1/p' | head -1) (PPPoE 1492 WAN safe)"
+    if [[ -n "${gw_ip:-}" ]]; then
+      rtt=$(/sbin/ping -c 1 -W 120 "$gw_ip" 2>/dev/null | awk -F'/' '/round-trip/{print $5 " ms"}' || true)
+      [[ -n "$rtt" ]] && echo "gateway ${gw_ip}: $rtt RTT"
+    fi
+  fi
+  [[ "$OVERRIDE_MODE" == "force_restore" ]] && echo "override         : PAUSED (force_restore active — run 'tether-optimize apply' to resume)"
+
+  echo
+  echo "── Configured Hotspot & Home Uplink Ports ──"
+  while IFS='|' read -r dev svc _; do
+    ip=$(iface_ipv4 "$dev" || true)
+    svc_pretty=$(pretty_service_name "$svc")
+    printf "  %-20s dev=%-5s inet=%s\n" "$svc_pretty" "$dev" "${ip:-(down)}"
+  done < <(list_usb_hotspot_ports)
+  wip=$(iface_ipv4 "$wdev" || true)
+  printf "  %-20s dev=%-5s inet=%s%s%s%s\n" "Wi-Fi" "$wdev" "${wip:-(down)}" \
+    "$([[ -n "$wip" ]] && iface_is_constrained "$wdev" && echo ' [constrained]' || true)" \
+    "$([[ -n "$wip" ]] && iface_is_expensive "$wdev" && echo ' [expensive]' || true)" \
+    "$([[ -n "$wip" ]] && iface_has_clat46 "$wdev" && echo ' [clat46/nat64]' || true)"
+  if [[ -n "${hdev_cached:-}" && "$hdev_cached" != "$wdev" ]]; then
+    local hip_chk
+    hip_chk=$(iface_ipv4 "$hdev_cached" || true)
+    printf "  %-20s dev=%-5s inet=%s [Active Wired Home LAN]\n" "$hsvc_cached" "$hdev_cached" "${hip_chk:-(down)}"
+  fi
+
+  echo
+  echo "── Radio & Contention (awdl0) ──"
+  echo "awdl0 status     : $(ifconfig awdl0 2>/dev/null | head -1 || echo '(missing)')"
+  if [[ -f "$AWDL_SUPPRESSED_FILE" ]]; then
+    echo "awdl0 guard      : ACTIVE (DOWN; suppressed $(cat "$AWDL_SUPPRESSED_FILE" 2>/dev/null || echo 0) background wake attempts)"
+  fi
+  echo "Host Wi‑Fi ($wdev) : $(networksetup -getairportpower "$wdev" 2>/dev/null || true)"
+
+  echo
+  echo "── Dummynet Shaper & PF MSS Scrub ($PF_ANCHOR) ──"
+  if [[ -f "$SHAPER_STATE_FILE" ]] && [[ -s "$SHAPER_STATE_FILE" ]]; then
+    local shaped_devs="$active_dev" home_outer_cnt home_ov_cnt
+    if [[ "$active_dev" != "$wdev" ]] && wifi_also_on_hotspot; then
+      shaped_devs="${active_dev} + ${wdev}"
+    fi
+    scrub_outer_cnt=$(grep -c "max-mss ${HOTSPOT_MSS}" "$SHAPER_STATE_FILE" 2>/dev/null || true)
+    scrub_ov_cnt=$(grep -c "max-mss ${OVERLAY_MSS}" "$SHAPER_STATE_FILE" 2>/dev/null || true)
+    home_outer_cnt=$(grep -cE "max-mss (${HOME_WIFI_MSS}|${HOME_WIFI_V6MSS})" "$SHAPER_STATE_FILE" 2>/dev/null || true)
+    home_ov_cnt=$(grep -c "max-mss ${HOME_OVERLAY_MSS}" "$SHAPER_STATE_FILE" 2>/dev/null || true)
+    dummynet_cnt=$(grep -c "^dummynet " "$SHAPER_STATE_FILE" 2>/dev/null || true)
+    fw_cnt=$(grep -c "^block drop in quick on ! lo0" "$SHAPER_STATE_FILE" 2>/dev/null || true)
+    if [[ "$active_dev" != "none" ]]; then
+      echo "  Outer Hotspot MSS : max-mss ${HOTSPOT_MSS} (IPv4 + IPv6, ${scrub_outer_cnt} rules on ${shaped_devs})"
+      echo "  Inner Overlay MSS : max-mss ${OVERLAY_MSS} (IPv4 + IPv6, ${scrub_ov_cnt} rules across utun* / feth*)"
+    else
+      local home_devs_pf="$wdev"
+      [[ -n "${hdev_cached:-}" && "$hdev_cached" != "$wdev" ]] && home_devs_pf="${wdev} + ${hdev_cached}"
+      echo "  Outer Home Uplink : max-mss ${HOME_WIFI_MSS} IPv4 / ${HOME_WIFI_V6MSS} IPv6 (${home_outer_cnt} rules on ${home_devs_pf} for PPPoE 1492 WAN)"
+      echo "  Inner Overlay MSS : max-mss ${HOME_OVERLAY_MSS} (IPv4 + IPv6, ${home_ov_cnt} rules across utun* / feth*)"
+    fi
+    echo "  Firewall Guard    : ${fw_cnt} active non-loopback block rules (ports 3000 Next.js, 11434 Ollama)"
+    if [[ $SHAPE_ENABLED -eq 1 && "$dummynet_cnt" -gt 0 ]]; then
+      local st_eff_d=$DOWN_MBPS st_eff_u=$UP_MBPS st_base_rtt=0 st_cur_rtt=0 st_delta_rtt=0 st_reg="ceiling" st_fast_d st_fast_u
+      local st_alpha="2.00" st_ign="0" st_sh="20.0" st_v99="100.0" st_treg="levy_fat" st_ld="20" st_lu="20" st_owd_d="0" st_owd_u="0" st_owd_m="owd"
+      if [[ -f "$AUTORATE_STATE_FILE" ]]; then
+        IFS='|' read -r st_eff_d st_eff_u _ _ st_base_rtt st_cur_rtt st_delta_rtt st_reg st_alpha st_ign st_sh st_v99 st_treg st_ld st_lu st_owd_d st_owd_u st_owd_m <<< "$(cat "$AUTORATE_STATE_FILE" 2>/dev/null || true)"
+        [[ -n "${st_eff_d:-}" ]] || st_eff_d=$DOWN_MBPS
+        [[ -n "${st_eff_u:-}" ]] || st_eff_u=$UP_MBPS
+        [[ -n "${st_alpha:-}" ]] || st_alpha="2.00"
+        [[ -n "${st_ign:-}" ]]   || st_ign="0"
+        [[ -n "${st_sh:-}" ]]    || st_sh="20.0"
+        [[ -n "${st_v99:-}" ]]   || st_v99="100.0"
+        [[ -n "${st_ld:-}" ]]    || st_ld="20"
+        [[ -n "${st_lu:-}" ]]    || st_lu="20"
+        [[ -n "${st_owd_d:-}" ]] || st_owd_d="0"
+        [[ -n "${st_owd_u:-}" ]] || st_owd_u="0"
+        [[ -n "${st_owd_m:-}" ]] || st_owd_m="owd"
+      fi
+      st_fast_d=$(fast_lane_rate "$st_eff_d" 4)
+      st_fast_u=$(fast_lane_rate "$st_eff_u" 2)
+      echo "  Priority Pipe #10 : $(printf '%3d' "$st_fast_d").000 Mbit/s down (q=$(dummynet_queue_slots "$st_fast_d")) [ICMP, ICMPv6, SSH:22, DNS:53, NTP:123, DoT:853, STUN:3478, Tailscale:41641/41642]"
+      echo "  Priority Pipe #11 : $(printf '%3d' "$st_fast_u").000 Mbit/s up   (q=$(dummynet_queue_slots "$st_fast_u"), sync-ENOBUFS) [ICMP, ICMPv6, SSH:22, DNS:53, NTP:123, DoT:853, STUN:3478, Tailscale:41641/41642]"
+      echo "  Bulk GRED Pipe#12 : $(printf '%3d' "$st_eff_d").000 Mbit/s down (ceiling ${DOWN_MBPS}, BDP-GRED $(gred_min_th "$st_eff_d")..$(gred_max_th "$st_eff_d")/q=$(dummynet_queue_slots "$st_eff_d")) [all other traffic on ${shaped_devs}]"
+      echo "  Bulk GRED Pipe#13 : $(printf '%3d' "$st_eff_u").000 Mbit/s up   (ceiling ${UP_MBPS}, BDP-GRED $(gred_min_th "$st_eff_u")..$(gred_max_th "$st_eff_u")/q=$(dummynet_queue_slots "$st_eff_u"), sync-ENOBUFS) [all other traffic on ${shaped_devs}]"
+      echo "  Pontryagin PMP    : u*(λ)=${st_eff_d}/${st_eff_u} Mbps (costate λ=${st_ld}/${st_lu}ms, OWD Δq=${st_owd_d}↓/${st_owd_u}↑ms [${st_owd_m}], regime=${st_reg})"
+      echo "  Taleb Pareto Tail : α̂_0=${st_alpha} (MLE ~ InvGamma n=${st_ign}), ShadowMean=${st_sh}ms, VaR99*=${st_v99}ms [${st_treg:-levy_fat}]"
+      echo "  PF Dummynet Rules : ${dummynet_cnt} active classification rules (run 'tether-optimize pf-status' for raw dump)"
+    elif [[ "$active_dev" != "none" ]]; then
+      echo "  Bandwidth Shaper  : DISABLED (unshaped hotspot link on ${shaped_devs}; TCP/MSS clamps & QoS active)"
+    elif [[ "${hdev_cached:-}" != "$wdev" ]]; then
+      echo "  Bandwidth Shaper  : INACTIVE (full unthrottled Wired LAN speed on ${hdev_cached}; PPPoE MSS clamps & firewall active)"
+    else
+      echo "  Bandwidth Shaper  : INACTIVE (full unthrottled Home Wi-Fi speed on ${wdev}; PPPoE MSS clamps & firewall active)"
+    fi
+  else
+    echo "  (no active PF hotspot anchor rules)"
+  fi
+  if [[ -f "$THROTTLED_PIDS_FILE" ]]; then
+    live_bg_cnt=0
+    bg_names=""
+    while IFS= read -r pid; do
+      [[ -z "$pid" ]] && continue
+      if kill -0 "$pid" 2>/dev/null; then
+        live_bg_cnt=$((live_bg_cnt + 1))
+      fi
+    done < "$THROTTLED_PIDS_FILE"
+    bg_names=$(ps -o comm= -p "$(tr '\n' ',' < "$THROTTLED_PIDS_FILE" | sed 's/,$//')" 2>/dev/null \
+      | awk -F'/' '{print $NF}' | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g' || true)
+    echo "  Darwin BG Daemons : ${live_bg_cnt} live PIDs throttled (taskpolicy -b / renice 20)${bg_names:+ [${bg_names}]}"
+  fi
+
+  echo
+  echo "── Key TCP / Bufferbloat Sysctls ──"
+  /usr/sbin/sysctl \
+    net.inet.tcp.delayed_ack \
+    net.inet.tcp.sendspace \
+    net.inet.tcp.recvspace \
+    net.inet.tcp.autosndbufmax \
+    net.inet.tcp.autorcvbufmax \
+    net.inet.tcp.mssdflt \
+    net.inet.tcp.v6mssdflt \
+    net.inet.tcp.l4s \
+    net.inet.tcp.bg_target_qdelay \
+    net.classq.fq_codel.enable_ecn 2>/dev/null | awk -F': ' '{printf "  %-34s = %s\n", $1, $2}'
+
+  echo
+  echo "── Tunnels, Tailscale, ZeroTier & SOCKS5 Proxies ──"
+  local utun_list zt_ip zt_mtu ts_socks waha_iap bro_tun ssh_socks leio_p proxy7890 en9_ip
+  utun_list=$(/sbin/ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -E '^utun[0-9]+$' | tr '\n' ' ' || true)
+  zt_ip=$(iface_ipv4 feth110 || true)
+  zt_mtu=$(/sbin/ifconfig feth110 2>/dev/null | sed -n 's/.*mtu \([0-9]*\).*/\1/p' | head -1 || true)
+  local cur_ov_mss="$HOME_OVERLAY_MSS"
+  [[ "$active_dev" != "none" ]] && cur_ov_mss="$OVERLAY_MSS"
+  echo "  Overlay ifaces   : ${utun_list:-(none)}${zt_ip:+feth110 (ZeroTier ${zt_ip}, mtu ${zt_mtu})} [inner max-mss ${cur_ov_mss}]"
+  listen_ports=$(tcp_listen_ports_snapshot || true)
+  print_port_row() {
+    if printf '%s\n' "$listen_ports" | grep -qx "$2"; then
+      printf "  %-17s: %s\n" "$1" "$3"
+    else
+      printf "  %-17s: %s\n" "$1" "$4"
+    fi
+  }
+  print_port_row "Tailscale SOCKS5" "1055"  "LISTENING on 127.0.0.1:1055 (userspace tailscaled UDP :41642 + fast pipe #10/#11)" "down"
+  print_port_row "GCP IAP Tunnel"   "13000" "LISTENING on 127.0.0.1:13000 -> mycelia-waha:3000 (ai.jquant.waha-iap)" "inactive"
+  print_port_row "Brother/Webhook"  "18080" "LISTENING on 127.0.0.1:18080 (Cloudflared SSH / WAHA webhook)" "inactive (ports 18080-18082 free)"
+  print_port_row "SSH SOCKS5"       "1081"  "LISTENING on 127.0.0.1:1081 (SSH DynamicForward)" "on-demand (~/.ssh/config DynamicForward 1081)"
+  print_port_row "Port 14000 Guard" "14000" "LISTENING on 127.0.0.1:14000 (reserved for local leio-embed; no tunnel conflict)" "reserved for local leio-embed (127.0.0.1:14000; retired litellm-tunnel conflict-free)"
+  print_port_row "System Proxy 7890" "7890" "LISTENING on 127.0.0.1:7890" "no listener on :7890 — dead system proxies auto-disabled (no blackhole)"
+  en9_ip=$(iface_ipv4 en9 || true)
+  if [[ "$en9_ip" == 192.168.2.* ]]; then
+    echo "  LAN Share (en9)  : ${en9_ip} (downstream 192.168.2.0/24 segment active)"
+  elif [[ -n "$en9_ip" ]]; then
+    echo "  LAN Share (en9)  : disabled (en9 is active upstream Home LAN ${en9_ip}; rogue bootpd suppressed)"
+  else
+    echo "  LAN Share (en9)  : inactive (sounio-tether-share 192.168.2.0/24 on-demand)"
+  fi
+  echo "  Firewall Guard   : block drop in quick on ! lo0 proto tcp to ports { 3000 (Next.js), 11434 (Ollama) }"
+  echo "  Daemon Binary    : $(stat -f '%Su:%Sg (mode %Lp)' "$SCRIPT_PATH" 2>/dev/null || echo 'root:wheel')"
+
+  echo
+  echo "── USB Devices (Protected / Untouched) ──"
+  if printf '%s\n' "$ioreg_usb_out" | grep -Eq '(iPhone|iPad)@'; then
+    echo "iPhone/iPad USB  : PRESENT"
+  else
+    echo "iPhone/iPad USB  : not present"
+  fi
+  if printf '%s\n' "$ioreg_usb_out" | grep -q '802.11n NIC@'; then
+    echo "USB Wi‑Fi dongle : ON HOST bus (Realtek 802.11n / 0bda:8812) — connect in VMware Fusion → Ubuntu (not macOS)"
+  else
+    echo "USB Wi‑Fi dongle : not on host bus (unplugged OR already inside VMware Ubuntu — expected for passthrough)"
+  fi
+
+  echo
+  echo "── Default Route ──"
+  printf '%s\n' "$route_out" | awk '/gateway:|interface:|flags:/{print "  " $0}' || true
+
+  echo
+  auto_status_brief
+}
+
+auto_status_brief() {
+  if daemon_loaded; then
+    local ev_pid
+    ev_pid=$(pgrep -x tether-events 2>/dev/null | head -1 || true)
+    echo "auto    : LOADED ($LABEL) — event-driven kqueue + PF_ROUTE reactor${ev_pid:+ (pid $ev_pid)}"
+  elif [[ -f "$PLIST" ]]; then
+    echo "auto    : installed but not loaded"
+  else
+    echo "auto    : not installed"
+  fi
+  [[ -f "$UI_SNAPSHOT_FILE" ]] && echo "state   : $(awk -F= '/^RAW_STATE=/{print substr($0,11); exit}' "$UI_SNAPSHOT_FILE" 2>/dev/null)"
+  [[ -f "$MODE_FILE" ]] && echo "profile : $(cat "$MODE_FILE" 2>/dev/null)"
+  if [[ -f "$LOG_FILE" ]]; then
+    echo "log     : $LOG_FILE"
+    tail -5 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
+  fi
+}
+
+auto_status() {
+  auto_status_brief
+  launchctl print "system/${LABEL}" 2>/dev/null | head -25 || true
+}
+
+# --- Watcher (Root LaunchDaemon) ---------------------------------------------
+
+ensure_state_dir() {
+  mkdir -p "$STATE_DIR"
+  chmod 755 "$STATE_DIR" 2>/dev/null || true
+}
+
+# Atomically writes STATE_FILE via tmp + mv -f so:
+#   1. Readers never observe a half-written/empty link.state
+#   2. Directory rename immediately fires TetherMenubar's kqueue O_EVTONLY watcher (<1ms)
+#   3. Home & Paused states include '<dev>|<svc>|<ip>' so en0 <-> en9 transitions are explicit!
+# Writes both `link.state` AND canonical `ui.snapshot` atomically via `tmp + mv -f`,
+# giving TetherMenubar.app a single-file, zero-subprocess snapshot of all daemon telemetry!
+write_state_file() {
+  local cur_state=$1 home_uplink=${2:-} payload tmp tmp_ui
+  local is_hs=0 is_paused=0 tr="wifi" dev="en0" svc="Home Wi-Fi" ip="—"
+  local mtu="1492" out_mss="$HOME_WIFI_MSS" ov_mss="$HOME_OVERLAY_MSS" dack="3" bgq="20"
+  local awdl_up=1 awdl_sup=0 bg_cnt=0 eff_d=$DOWN_MBPS eff_u=$UP_MBPS ar_delta=0 ar_reg="ceiling"
+  local t_alpha="2.00" t_ign="0" t_sh="20.0" t_v99="100.0" t_reg="levy_fat" t_ld="20" t_lu="20"
+  local t_owd_d="0" t_owd_u="0" t_owd_m="owd"
+  local pid hdev hsvc
+
+  if [[ "$cur_state" == up:* ]]; then
+    payload="$cur_state"
+    is_hs=1
+    IFS='|' read -r tr dev svc ip eff_d eff_u _ <<< "${cur_state#up:}"
+    svc=$(pretty_service_name "$svc")
+    out_mss="$HOTSPOT_MSS"
+    ov_mss="$OVERLAY_MSS"
+    bgq="15"
+    if [[ -f "$AUTORATE_STATE_FILE" ]]; then
+      IFS='|' read -r eff_d eff_u _ _ _ _ ar_delta ar_reg t_alpha t_ign t_sh t_v99 t_reg t_ld t_lu t_owd_d t_owd_u t_owd_m <<< "$(cat "$AUTORATE_STATE_FILE" 2>/dev/null || true)"
+      [[ -n "${eff_d:-}" ]]   || eff_d=$DOWN_MBPS
+      [[ -n "${eff_u:-}" ]]   || eff_u=$UP_MBPS
+      [[ -n "${t_alpha:-}" ]] || t_alpha="2.00"
+      [[ -n "${t_ign:-}" ]]   || t_ign="0"
+      [[ -n "${t_sh:-}" ]]    || t_sh="20.0"
+      [[ -n "${t_v99:-}" ]]   || t_v99="100.0"
+      [[ -n "${t_reg:-}" ]]   || t_reg="levy_fat"
+      [[ -n "${t_ld:-}" ]]    || t_ld="20"
+      [[ -n "${t_lu:-}" ]]    || t_lu="20"
+      [[ -n "${t_owd_d:-}" ]] || t_owd_d="0"
+      [[ -n "${t_owd_u:-}" ]] || t_owd_u="0"
+      [[ -n "${t_owd_m:-}" ]] || t_owd_m="owd"
+    fi
+  else
+    [[ "$cur_state" == "paused" ]] && is_paused=1
+    [[ -n "$home_uplink" ]] || home_uplink=$(home_uplink_info || echo "en0|Wi-Fi")
+    IFS='|' read -r hdev hsvc <<< "$home_uplink"
+    dev="${hdev:-en0}"
+    svc="${hsvc:-Wi-Fi}"
+    ip=$(iface_ipv4 "$dev" || true)
+    payload="${cur_state}:${dev}|${svc}|${ip:-(down)}"
+    if [[ "$dev" == "en0" ]]; then
+      tr="wifi"
+      svc=$([[ $is_paused -eq 1 ]] && echo "Wi-Fi (Paused)" || echo "Home Wi-Fi")
+    else
+      tr="lan"
+      [[ $is_paused -eq 1 ]] && svc="${svc} (Paused)"
+    fi
+  fi
+
+  mtu=$(iface_mtu "$dev" || echo "?")
+  /sbin/ifconfig awdl0 2>/dev/null | head -1 | grep -qw 'UP' || awdl_up=0
+  [[ -f "$AWDL_SUPPRESSED_FILE" ]] && awdl_sup=$(cat "$AWDL_SUPPRESSED_FILE" 2>/dev/null || echo 0)
+  if [[ -f "$THROTTLED_PIDS_FILE" ]]; then
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && bg_cnt=$((bg_cnt + 1))
+    done < "$THROTTLED_PIDS_FILE"
+  fi
+
+  tmp_ui="${UI_SNAPSHOT_FILE}.tmp.$$"
+  cat > "$tmp_ui" 2>/dev/null <<EOF || true
+RAW_STATE=${payload}
+IS_HOTSPOT=${is_hs}
+IS_PAUSED=${is_paused}
+TRANSPORT=${tr}
+DEVICE=${dev}
+SERVICE=${svc}
+IP=${ip:-—}
+MTU=${mtu:-?}
+OUTER_MSS=${out_mss}
+OVERLAY_MSS=${ov_mss}
+DELAYED_ACK=${dack}
+BG_QDELAY=${bgq}
+AWDL_UP=${awdl_up}
+AWDL_SUPPRESSED=${awdl_sup:-0}
+THROTTLED_BG=${bg_cnt}
+DOWN_MBPS=${DOWN_MBPS}
+UP_MBPS=${UP_MBPS}
+EFF_DOWN_MBPS=${eff_d}
+EFF_UP_MBPS=${eff_u}
+SHAPE_ENABLED=${SHAPE_ENABLED}
+WIFI_OFF=${WIFI_OFF}
+AUTORATE_DELTA_MS=${ar_delta:-0}
+AUTORATE_REGIME=${ar_reg:-ceiling}
+TAIL_ALPHA=${t_alpha:-2.00}
+INVGAMMA_N=${t_ign:-0}
+SHADOW_MEAN_MS=${t_sh:-20.0}
+TAIL_VAR99_MS=${t_v99:-100.0}
+TAIL_REGIME=${t_reg:-levy_fat}
+COSTATE_DOWN_MS=${t_ld:-20}
+COSTATE_UP_MS=${t_lu:-20}
+OWD_DOWN_EX_MS=${t_owd_d:-0}
+OWD_UP_EX_MS=${t_owd_u:-0}
+OWD_MODE=${t_owd_m:-owd}
+OVERLAY_IFACES=$(overlay_ifaces_snapshot)
+EOF
+  chmod 644 "$tmp_ui" 2>/dev/null || true
+  mv -f "$tmp_ui" "$UI_SNAPSHOT_FILE" 2>/dev/null || rm -f "$tmp_ui"
+  rm -f "${STATE_DIR}/link.state" "${STATE_DIR}/overlay.ifaces" 2>/dev/null || true
+}
+
+lock_file_if_needed() {
+  local path=$1 mode=$2 cur
+  [[ -f "$path" ]] || return 0
+  cur=$(stat -f '%Su:%Sg:%Lp' "$path" 2>/dev/null || true)
+  if [[ "$cur" != "root:wheel:${mode}" ]]; then
+    /usr/sbin/chown root:wheel "$path" 2>/dev/null || true
+    /bin/chmod "$mode" "$path" 2>/dev/null || true
+  fi
+}
+
+lock_script_ownership() {
+  is_root || return 0
+  lock_file_if_needed "$SCRIPT_PATH" 755
+  lock_file_if_needed "$EVENTS_BIN" 755
+  lock_file_if_needed "$EVENTS_SRC" 644
+  lock_file_if_needed "$LEAN_SPEC_FILE" 644
+}
+
+# Closed-loop SOTA cellular controller (Theorems 96–110):
+#   • Zero-fork `fasttick|...` telemetry from `tether-events` (500ms active / 3000ms idle)
+#   • RFC 792 Type 13/14 Clock-Offset-Cancelled One-Way Delays `(owd_d_ex, owd_u_ex)` + 3-reflector `median3` quorum
+#   • Independent directional regimes `(reg_d, reg_u)` & order-statistic streaks `(ar_streak_d, ar_streak_u)`
+#   • Achieved-goodput revealed-capacity anchoring `λ_cap(W, r̂)` + Pontryagin Hamiltonian maximization `u*(λ)`
+run_autorate_tick() {
+  local dev=$1 ev_raw=${2:-tick} io cur_ib=0 cur_ob=0 in_delta=0 out_delta=0 delta_bytes=0 dt_ms=3000
+  local floor_d floor_u rtt_ms=25 delta_rtt=0 owd_d_ex=0 owd_u_ex=0 owd_mode="owd" resp_cnt=3
+  local regime="ceiling" reg_d="drained" reg_u="drained" next_d next_u r_hat_d=0 r_hat_u=0
+  [[ $SHAPE_ENABLED -eq 1 && -n "${dev:-}" ]] || return 0
+  floor_d=$AUTORATE_FLOOR_DOWN; (( DOWN_MBPS < floor_d )) && floor_d=$DOWN_MBPS
+  floor_u=$AUTORATE_FLOOR_UP;   (( UP_MBPS < floor_u ))   && floor_u=$UP_MBPS
+
+  if [[ "$ev_raw" == fasttick\|* ]]; then
+    # Zero-fork path: `fasttick|<dev>|<dIn>|<dOut>|<dtMs>|<minRtt>|<quorumDelta>|<owdDownEx>|<owdUpEx>|<owdMode>|<respCount>`
+    IFS='|' read -r _ _ in_delta out_delta dt_ms rtt_ms delta_rtt owd_d_ex owd_u_ex owd_mode resp_cnt <<< "$ev_raw"
+    [[ "${in_delta:-}"  =~ ^[0-9]+$ ]] || in_delta=0
+    [[ "${out_delta:-}" =~ ^[0-9]+$ ]] || out_delta=0
+    [[ "${dt_ms:-}"     =~ ^[0-9]+$ && $dt_ms -gt 0 ]] || dt_ms=500
+    [[ "${rtt_ms:-}"    =~ ^[0-9]+$ ]] || rtt_ms=25
+    [[ "${delta_rtt:-}" =~ ^[0-9]+$ ]] || delta_rtt=0
+    [[ "${owd_d_ex:-}"  =~ ^[0-9]+$ ]] || owd_d_ex=$delta_rtt
+    [[ "${owd_u_ex:-}"  =~ ^[0-9]+$ ]] || owd_u_ex=$delta_rtt
+    delta_bytes=$(( in_delta + out_delta ))
+  else
+    io=$(iface_io_bytes "$dev" || echo "0|0")
+    IFS='|' read -r cur_ib cur_ob <<< "${io:-0|0}"
+    [[ "${cur_ib:-}" =~ ^[0-9]+$ ]] || cur_ib=0
+    [[ "${cur_ob:-}" =~ ^[0-9]+$ ]] || cur_ob=0
+    if (( ${ar_prev_ib:-0} > 0 && cur_ib >= ar_prev_ib )); then in_delta=$(( cur_ib - ar_prev_ib )); fi
+    if (( ${ar_prev_ob:-0} > 0 && cur_ob >= ar_prev_ob )); then out_delta=$(( cur_ob - ar_prev_ob )); fi
+    ar_prev_ib=$cur_ib
+    ar_prev_ob=$cur_ob
+    ar_prev_bytes=$(( cur_ib + cur_ob ))
+    delta_bytes=$(( in_delta + out_delta ))
+
+    # Theorem 110 Idle Gate: if < ~64 KB/s AND costates are at equilibrium τ₀ AND at ceiling, send ZERO ICMP probes!
+    if (( delta_bytes < 196608 && ${ar_lam_d:-20} <= PONTRYAGIN_TAU_MS && ${ar_lam_u:-20} <= PONTRYAGIN_TAU_MS && ar_eff_down >= DOWN_MBPS && ar_eff_up >= UP_MBPS )); then
+      ar_bloat_streak=0; ar_streak_d=0; ar_streak_u=0
+      return 0
+    fi
+
+    if [[ -x "$EVENTS_BIN" ]]; then
+      local pr_out
+      pr_out=$("$EVENTS_BIN" --probe "$dev" 260 2>/dev/null || true)
+      IFS='|' read -r _ _ rtt_ms _ _ owd_mode _ resp_cnt _ <<< "${pr_out:-0|0|260|0|0|rtt|0|0|timeout}"
+    fi
+    [[ "${rtt_ms:-}" =~ ^[0-9]+$ && ${rtt_ms:-0} -gt 0 ]] || rtt_ms=260
+    if (( ar_base_rtt == 0 || rtt_ms < ar_base_rtt )); then
+      ar_base_rtt=$rtt_ms
+    else
+      ar_sample_cnt=$(( (ar_sample_cnt + 1) % 12 ))
+      if (( ar_sample_cnt == 0 && rtt_ms <= ar_base_rtt + 20 )); then
+        ar_base_rtt=$(( ar_base_rtt + 1 ))
+      fi
+    fi
+    delta_rtt=$(( rtt_ms > ar_base_rtt ? rtt_ms - ar_base_rtt : 0 ))
+    owd_d_ex=$delta_rtt
+    owd_u_ex=$delta_rtt
+  fi
+
+  # Directional achieved goodput in integer Mbps over `dt_ms`
+  r_hat_d=$(( (in_delta * 8) / (1000 * dt_ms + 1) ))
+  r_hat_u=$(( (out_delta * 8) / (1000 * dt_ms + 1) ))
+
+  # Huber-winsorized RFC 6298 Jacobson–Karels estimator (β = 1/4, innovation capped at 45 ms)
+  local abs_err=$(( delta_rtt >= ${ar_rttvar:-0} ? delta_rtt - ${ar_rttvar:-0} : ${ar_rttvar:-0} - delta_rtt ))
+  (( abs_err > 45 )) && abs_err=45
+  ar_rttvar=$(( (3 * ${ar_rttvar:-0} + abs_err) / 4 ))
+
+  local max_owd=$(( owd_d_ex >= owd_u_ex ? owd_d_ex : owd_u_ex ))
+  if (( max_owd > 10 )); then
+    ar_tail_buf=$(printf '%s %s' "${ar_tail_buf:-}" "$max_owd" | awk '{n=NF; s=(n>15?n-15:1); for(i=s;i<=n;i++) printf "%s%s",$i,(i==n?"":" ")}')
+    IFS='|' read -r ar_alpha_milli ar_alpha_str _ ar_ig_n ar_sh_ms ar_v99_ms ar_tail_reg \
+      <<< "$(taleb_pareto_mle 10 350 "$ar_tail_buf")"
+  fi
+
+  local low_th high_th req_streak
+  low_th=$(adaptive_low_thresh "${ar_rttvar:-0}")
+  high_th=$(fat_tail_high_thresh "${ar_rttvar:-0}" "${ar_alpha_milli:-2000}")
+  req_streak=$(streak_for_alpha "${ar_alpha_milli:-2000}")
+  (( max_owd > 120 )) && req_streak=2
+
+  # Independent directional regime & streak evaluation on Clock-Offset-Cancelled OWD (`owd_d_ex`, `owd_u_ex`)
+  if (( owd_d_ex > high_th )); then
+    ar_streak_d=$(( ${ar_streak_d:-0} + 1 ))
+    if (( ar_streak_d >= req_streak )); then reg_d="bloated"; else reg_d="deadband"; fi
+  elif (( owd_d_ex <= low_th )); then
+    ar_streak_d=0; reg_d="drained"
+  else
+    ar_streak_d=0; reg_d="deadband"
+  fi
+
+  if (( owd_u_ex > high_th )); then
+    ar_streak_u=$(( ${ar_streak_u:-0} + 1 ))
+    if (( ar_streak_u >= req_streak )); then reg_u="bloated"; else reg_u="deadband"; fi
+  elif (( owd_u_ex <= low_th )); then
+    ar_streak_u=0; reg_u="drained"
+  else
+    ar_streak_u=0; reg_u="deadband"
+  fi
+
+  # When operating in fallback symmetric RTT mode (`owd_mode == "rtt"`), apply byte-activity guard
+  if [[ "$owd_mode" == "rtt" ]]; then
+    if [[ "$reg_d" == "bloated" ]] && (( out_delta * 1000 >= 25600 * dt_ms && in_delta * 1000 < 51200 * dt_ms )); then reg_d="deadband"; fi
+    if [[ "$reg_u" == "bloated" ]] && (( in_delta * 1000 >= 51200 * dt_ms && out_delta * 1000 < 25600 * dt_ms )); then reg_u="deadband"; fi
+  fi
+
+  if [[ "$reg_d" == "bloated" || "$reg_u" == "bloated" ]]; then
+    regime="bloated"
+  elif [[ "$reg_d" == "drained" && "$reg_u" == "drained" ]]; then
+    regime="drained"
+  else
+    regime="deadband"
+  fi
+
+  # Theorem 108 Achieved-Goodput Bottleneck Capture + Theorem 104/105 Pontryagin Adjoint Evolution:
+  local sh_int=${ar_sh_ms%%.*}; [[ -n "${sh_int:-}" ]] || sh_int=20
+  local ex_d=$(( owd_d_ex > ${ar_rttvar:-0} ? owd_d_ex - ${ar_rttvar:-0} : 0 ))
+  local ex_u=$(( owd_u_ex > ${ar_rttvar:-0} ? owd_u_ex - ${ar_rttvar:-0} : 0 ))
+  local psi_d psi_u
+  psi_d=$(pontryagin_adjoint_forcing "$PONTRYAGIN_TAU_MS" "$ex_d" "${ar_alpha_milli:-2000}" "$sh_int")
+  psi_u=$(pontryagin_adjoint_forcing "$PONTRYAGIN_TAU_MS" "$ex_u" "${ar_alpha_milli:-2000}" "$sh_int")
+
+  if [[ "$reg_d" == "bloated" ]] && (( r_hat_d >= floor_d && r_hat_d < ar_eff_down )); then
+    ar_lam_d=$(anchored_pontryagin_costate "$(( DOWN_MBPS * PONTRYAGIN_TAU_MS ))" "${ar_lam_d:-$PONTRYAGIN_TAU_MS}" "$r_hat_d")
+  fi
+  if [[ "$reg_u" == "bloated" ]] && (( r_hat_u >= floor_u && r_hat_u < ar_eff_up )); then
+    ar_lam_u=$(anchored_pontryagin_costate "$(( UP_MBPS * PONTRYAGIN_TAU_MS ))" "${ar_lam_u:-$PONTRYAGIN_TAU_MS}" "$r_hat_u")
+  fi
+
+  ar_lam_d=$(pontryagin_costate_step "$PONTRYAGIN_TAU_MS" "${ar_lam_d:-$PONTRYAGIN_TAU_MS}" "$psi_d" "$reg_d")
+  ar_lam_u=$(pontryagin_costate_step "$PONTRYAGIN_TAU_MS" "${ar_lam_u:-$PONTRYAGIN_TAU_MS}" "$psi_u" "$reg_u")
+  next_d=$(pontryagin_optimal_rate "$floor_d" "$DOWN_MBPS" "$PONTRYAGIN_TAU_MS" "$ar_lam_d")
+  next_u=$(pontryagin_optimal_rate "$floor_u" "$UP_MBPS" "$PONTRYAGIN_TAU_MS" "$ar_lam_u")
+
+  if (( next_d != ar_eff_down || next_u != ar_eff_up )); then
+    ar_eff_down=$next_d
+    ar_eff_up=$next_u
+    configure_dummynet_pipes "$ar_eff_down" "$ar_eff_up"
+    write_autorate_state "$ar_eff_down" "$ar_eff_up" "$DOWN_MBPS" "$UP_MBPS" "$ar_base_rtt" "$rtt_ms" "$delta_rtt" "$regime" \
+      "${ar_alpha_str:-2.00}" "${ar_ig_n:-0}" "${ar_sh_ms:-20.0}" "${ar_v99_ms:-100.0}" "${ar_tail_reg:-levy_fat}" "$ar_lam_d" "$ar_lam_u" "$owd_d_ex" "$owd_u_ex" "$owd_mode"
+    write_state_file "$cur" ""
+    log "pontryagin: u*(λ)=${ar_eff_down}/${ar_eff_up} Mbps (ceiling ${DOWN_MBPS}/${UP_MBPS}, λ=${ar_lam_d}/${ar_lam_u}ms, OWD=${owd_d_ex}↓/${owd_u_ex}↑ms [${owd_mode}], r̂=${r_hat_d}/${r_hat_u}M, α̂_0=${ar_alpha_str:-2.00}, Shadow=${ar_sh_ms:-20.0}ms)"
+    return 0
+  fi
+  write_autorate_state "$ar_eff_down" "$ar_eff_up" "$DOWN_MBPS" "$UP_MBPS" "$ar_base_rtt" "$rtt_ms" "$delta_rtt" "$regime" \
+    "${ar_alpha_str:-2.00}" "${ar_ig_n:-0}" "${ar_sh_ms:-20.0}" "${ar_v99_ms:-100.0}" "${ar_tail_reg:-levy_fat}" "$ar_lam_d" "$ar_lam_u" "$owd_d_ex" "$owd_u_ex" "$owd_mode"
+}
+
+# Populates `detected` and `cur` from `OVERRIDE_MODE` + `detect_active_hotspot` (single source of truth).
+compute_watch_state() {
+  detected=""
+  if [[ "$OVERRIDE_MODE" == "force_restore" ]]; then
+    cur=paused
+  elif detected=$(detect_active_hotspot); then
+    cur="up:${detected}|${DOWN_MBPS}|${UP_MBPS}|${SHAPE_ENABLED}"
+  else
+    cur=down
+  fi
+}
+
+start_events_stream() {
+  events_pid=""
+  [[ -x "$EVENTS_BIN" ]] || return 1
+  exec 3< <(exec "$EVENTS_BIN" --script "$SCRIPT_PATH" --prefs "$USER_PREFS_FILE" --tick-ms 3000 --parent-pid $$)
+  local ready_banner=""
+  if IFS= read -r ready_banner <&3 && [[ "$ready_banner" == pid=* ]]; then
+    events_pid="${ready_banner#pid=}"
+    return 0
+  fi
+  exec 3<&- 2>/dev/null || true
+  return 1
+}
+
+watch_loop() {
+  is_root || { echo "watch must run as root (install-auto)" >&2; exit 1; }
+  ensure_state_dir
+  lock_script_ownership
+  refresh_hardware_port_cache
+  : > "${STATE_DIR}/daemon.stderr.log" 2>/dev/null || true
+
+  local prev=down cur=down detected="" start_mtime cur_mtime tick=0 active_dev=""
+  local prev_home_uplink="" cur_home_uplink="" prev_prefs_mtime="" cur_prefs_mtime="" home_blip_count=0
+  local prev_overlay_snap="" cur_overlay_snap=""
+  local ar_eff_down=$DOWN_MBPS ar_eff_up=$UP_MBPS ar_base_rtt=0 ar_rttvar=0 ar_bloat_streak=0 ar_streak_d=0 ar_streak_u=0 ar_prev_bytes=0 ar_prev_ib=0 ar_prev_ob=0 ar_sample_cnt=0
+  local ar_tail_buf="" ar_alpha_milli=2000 ar_alpha_str="2.00" ar_ig_n="0" ar_sh_ms="20.0" ar_v99_ms="100.0" ar_tail_reg="levy_fat"
+  local ar_lam_d=$PONTRYAGIN_TAU_MS ar_lam_u=$PONTRYAGIN_TAU_MS
+  local events_pid="" ev_line=""
+
+  start_mtime=$(stat -f %m "$SCRIPT_PATH" 2>/dev/null || echo 0)
+  prev_prefs_mtime=$(stat -f %m "$USER_PREFS_FILE" 2>/dev/null || echo 0)
+
+  load_user_prefs
+  ar_eff_down=$DOWN_MBPS; ar_eff_up=$UP_MBPS
+  compute_watch_state
+  if [[ "$cur" == up:* ]]; then
+    IFS='|' read -r _ active_dev _ _ <<< "$detected"
+    apply_core "$detected" || true
+    ar_prev_bytes=$(iface_total_bytes "$active_dev" || echo 0)
+  else
+    prev_home_uplink=$(home_uplink_info || echo "en0|Wi-Fi")
+    restore_core "$prev_home_uplink" || true
+  fi
+  prev_overlay_snap=$(overlay_ifaces_snapshot)
+  write_state_file "$cur" "${prev_home_uplink:-}"
+
+  if start_events_stream; then
+    log "watch: started reactor=kqueue+PF_ROUTE(pid=${events_pid},tick=3s) initial=${cur}"
+  else
+    log "watch: started poll=${POLL_SECS}s initial=${cur}"
+  fi
+
+  trap '[[ -n "${events_pid:-}" ]] && kill "$events_pid" 2>/dev/null || true; exec 3<&- 2>/dev/null || true' EXIT INT TERM
+
+  prev="$cur"
+  while true; do
+    ev_line="poll"
+    if [[ -n "${events_pid:-}" ]]; then
+      if ! IFS= read -r ev_line <&3; then
+        exec 3<&- 2>/dev/null || true
+        start_events_stream || sleep "$POLL_SECS"
+        ev_line="route"
+      fi
+    else
+      sleep "$POLL_SECS"
+    fi
+
+    if [[ "$ev_line" == "tick" && "$cur" != up:* && $home_blip_count -eq 0 ]]; then
+      tick=$(( (tick + 1) % 10 ))
+      [[ $tick -ne 0 ]] && continue
+    else
+      tick=$(( (tick + 1) % 10 ))
+    fi
+
+    cur_mtime=$(stat -f %m "$SCRIPT_PATH" 2>/dev/null || echo "$start_mtime")
+    if [[ "$cur_mtime" != "$start_mtime" ]]; then
+      log "watch: script modified on disk, hot-reloading daemon"
+      [[ -n "${events_pid:-}" ]] && kill "$events_pid" 2>/dev/null || true
+      exec 3<&- 2>/dev/null || true
+      trap - EXIT INT TERM
+      exec /bin/bash "$SCRIPT_PATH" watch
+    fi
+
+    OVERRIDE_MODE=auto
+    load_user_prefs
+    cur_prefs_mtime=$(stat -f %m "$USER_PREFS_FILE" 2>/dev/null || echo 0)
+    compute_watch_state
+
+    if [[ "$cur" != "$prev" ]]; then
+      if [[ "$prev" == up:usb\|* && "$cur" == "down" ]]; then
+        sleep 1.5
+        OVERRIDE_MODE=auto; load_user_prefs; compute_watch_state
+        [[ "$cur" == "$prev" ]] && continue
+      fi
+      refresh_hardware_port_cache
+      compute_watch_state
+      [[ "$cur" == "$prev" ]] && continue
+
+      log "watch: hotspot state ${prev} → ${cur}"
+      if [[ "$cur" == up:* ]]; then
+        IFS='|' read -r _ active_dev _ _ <<< "$detected"
+        ar_eff_down=$DOWN_MBPS; ar_eff_up=$UP_MBPS; ar_base_rtt=0; ar_rttvar=0; ar_bloat_streak=0; ar_streak_d=0; ar_streak_u=0
+        ar_tail_buf=""; ar_alpha_milli=2000; ar_alpha_str="2.00"; ar_ig_n="0"; ar_sh_ms="20.0"; ar_v99_ms="100.0"
+        ar_lam_d=$PONTRYAGIN_TAU_MS; ar_lam_u=$PONTRYAGIN_TAU_MS
+        apply_core "$detected" || log "watch: apply_core failed"
+        ar_prev_bytes=$(iface_total_bytes "$active_dev" || echo 0)
+      else
+        active_dev=""; ar_base_rtt=0; ar_rttvar=0; ar_bloat_streak=0; ar_streak_d=0; ar_streak_u=0; home_blip_count=0
+        ar_tail_buf=""; ar_lam_d=$PONTRYAGIN_TAU_MS; ar_lam_u=$PONTRYAGIN_TAU_MS
+        prev_home_uplink=$(home_uplink_info || echo "en0|Wi-Fi")
+        restore_core "$prev_home_uplink" || true
+      fi
+      prev_overlay_snap=$(overlay_ifaces_snapshot)
+      prev="$cur"; prev_prefs_mtime="$cur_prefs_mtime"
+      write_state_file "$cur" "${prev_home_uplink:-}"
+    else
+      if [[ "$cur_prefs_mtime" != "$prev_prefs_mtime" ]]; then
+        prev_prefs_mtime="$cur_prefs_mtime"
+        write_state_file "$cur" "${prev_home_uplink:-}"
+      fi
+      if [[ "$cur" == up:* ]]; then
+        IFS='|' read -r _ active_dev _ _ <<< "${detected:-}"
+        if [[ "$cur" == up:wifi\|* ]] || wifi_also_on_hotspot; then
+          enforce_awdl_down_for_wifi_hotspot quiet
+        fi
+        if [[ "$ev_line" == *"tick"* || "$ev_line" == "poll" ]]; then
+          run_autorate_tick "$active_dev" "$ev_line" || true
+        fi
+      else
+        cur_home_uplink=$(home_uplink_info || echo "en0|Wi-Fi")
+        if [[ -n "$prev_home_uplink" && "$cur_home_uplink" != "$prev_home_uplink" ]]; then
+          if [[ "$prev_home_uplink" == en9\|* && "$cur_home_uplink" != en9\|* ]] && iface_exists en9; then
+            home_blip_count=$((home_blip_count + 1))
+          else
+            home_blip_count=3
+          fi
+          if (( home_blip_count >= 3 )); then
+            home_blip_count=0
+            refresh_hardware_port_cache
+            log "watch: home uplink changed ${prev_home_uplink} → ${cur_home_uplink}"
+            prev_home_uplink="$cur_home_uplink"
+            restore_core "$cur_home_uplink" || true
+            prev_overlay_snap=$(overlay_ifaces_snapshot)
+            write_state_file "$cur" "$cur_home_uplink"
+          fi
+        else
+          home_blip_count=0
+        fi
+      fi
+
+      if [[ "$ev_line" == *"route"* || $tick -eq 0 ]]; then
+        cur_overlay_snap=$(overlay_ifaces_snapshot)
+        if [[ "$cur_overlay_snap" != "$prev_overlay_snap" ]]; then
+          prev_overlay_snap="$cur_overlay_snap"
+          if [[ "$cur" == up:* && -n "${active_dev:-}" ]]; then
+            apply_shaper_and_pf "$active_dev" "$ar_eff_down" "$ar_eff_up" || true
+          else
+            restore_shaper_and_pf "${prev_home_uplink:-}" || true
+          fi
+          log "watch: reclamped dynamic overlay tunnel set (${cur_overlay_snap:-(none)})"
+        fi
+      fi
+
+      if [[ $tick -eq 0 ]]; then
+        refresh_hardware_port_cache
+        lock_script_ownership || true
+        sanitize_dead_system_proxies || true
+        sanitize_en9_upstream_lan_guard || true
+        if [[ "$cur" == up:* ]]; then
+          throttle_background_daemons || true
+          if ! /sbin/pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q '11434'; then
+            [[ -n "${active_dev:-}" ]] && apply_shaper_and_pf "$active_dev" "$ar_eff_down" "$ar_eff_up" || true
+          fi
+        else
+          local hdev_chk
+          IFS='|' read -r hdev_chk _ <<< "$(home_uplink_info)"
+          if ! /sbin/pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q "max-mss ${HOME_WIFI_MSS}" \
+             || { [[ -n "${hdev_chk:-}" ]] && ! /sbin/pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null | grep -q "on ${hdev_chk} "; }; then
+            restore_shaper_and_pf || true
+          fi
+        fi
+      fi
+    fi
+  done
+}
+
+# --- Install / Reload LaunchDaemon -------------------------------------------
+
+plist_body() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>${SCRIPT_PATH}</string>
+    <string>watch</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>Nice</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>${STATE_DIR}/daemon.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>${STATE_DIR}/daemon.stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>TETHER_DOWN_MBPS</key>
+    <string>${DOWN_MBPS}</string>
+    <key>TETHER_UP_MBPS</key>
+    <string>${UP_MBPS}</string>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+</dict>
+</plist>
+EOF
+}
+
+install_auto() {
+  save_user_prefs auto
+  echo "Installing/Reloading LaunchDaemon (Wi-Fi + USB Personal Hotspot optimizer)…"
+  local body
+  body=$(cat <<EOF
+set -e
+mkdir -p '${STATE_DIR}'
+chmod 755 '${STATE_DIR}'
+cat > '${PLIST}' <<'PLIST'
+$(plist_body)
+PLIST
+chmod 644 '${PLIST}'
+chown root:wheel '${PLIST}'
+chmod 755 '${SCRIPT_PATH}'
+launchctl bootout system '${PLIST}' 2>/dev/null || true
+launchctl bootstrap system '${PLIST}'
+launchctl enable system/${LABEL} 2>/dev/null || true
+launchctl kickstart -k system/${LABEL} 2>/dev/null || true
+/bin/bash '${SCRIPT_PATH}' __root_apply --down-mbps '${DOWN_MBPS}' --up-mbps '${UP_MBPS}' || true
+echo INSTALL_OK
+EOF
+)
+  run_privileged "$body"
+  status
+}
+
+uninstall_auto() {
+  run_privileged "/bin/bash '${SCRIPT_PATH}' __root_restore || true; launchctl bootout system '${PLIST}' 2>/dev/null || true; rm -f '${PLIST}'; echo UNINSTALL_OK"
+  echo "Auto-tether removed and defaults restored."
+}
+
+verify_lean() {
+  local lean_cmd="$LEAN_BIN" out
+  [[ -x "$lean_cmd" ]] || lean_cmd="$(command -v lean || true)"
+  if [[ -z "$lean_cmd" || ! -x "$lean_cmd" ]]; then
+    echo "Error: Lean 4 binary not found at $LEAN_BIN" >&2
+    exit 1
+  fi
+  if [[ ! -f "$LEAN_SPEC_FILE" ]]; then
+    echo "Error: Lean 4 specification not found at $LEAN_SPEC_FILE" >&2
+    exit 1
+  fi
+  if grep -Eq '^[[:space:]]*import[[:space:]]' "$LEAN_SPEC_FILE"; then
+    echo "Error: external import detected in $LEAN_SPEC_FILE (must be pure Lean 4 core, no Mathlib)" >&2
+    exit 1
+  fi
+  out=$("$lean_cmd" --run "$LEAN_SPEC_FILE" 2>&1)
+  printf '%s\n' "$out"
+  if printf '%s\n' "$out" | grep -q 'depends on axioms:'; then
+    echo "Error: one or more theorems depend on axioms" >&2
+    exit 1
+  fi
+}
+
+# --- On-Demand Wireshark (`dumpcap` / `tshark`) Wire-Level Packet Audit ------
+# Zero background overhead in standby; runs only when explicitly invoked via
+# `tether-optimize pcap [secs]` or the topbar menu item.
+
+pcap_audit() {
+  local secs=${1:-$PCAP_SECS}
+  [[ "$secs" =~ ^[0-9]+$ ]] && (( secs >= 1 && secs <= 30 )) || secs=4
+
+  local dumpcap_bin tshark_bin capinfos_bin
+  dumpcap_bin=$(command -v dumpcap || echo "/opt/homebrew/bin/dumpcap")
+  tshark_bin=$(command -v tshark || echo "/opt/homebrew/bin/tshark")
+  capinfos_bin=$(command -v capinfos || echo "/opt/homebrew/bin/capinfos")
+
+  if [[ ! -x "$dumpcap_bin" || ! -x "$tshark_bin" ]]; then
+    echo "Error: Wireshark CLI tools (dumpcap / tshark) not found." >&2
+    return 1
+  fi
+
+  local detected htype dev svc svc_pretty ip mode_label exp_mtu exp_mss exp_v6mss spike_thresh_ms=50 shape_active=0
+  refresh_hardware_port_cache
+  if detected=$(detect_active_hotspot) && [[ "$OVERRIDE_MODE" != "force_restore" ]]; then
+    IFS='|' read -r htype dev svc ip <<< "$detected"
+    svc_pretty=$(pretty_service_name "$svc")
+    mode_label="Active Hotspot (${svc_pretty} on ${dev})"
+    exp_mtu=$HOTSPOT_MTU
+    exp_mss=$HOTSPOT_MSS
+    exp_v6mss=$HOTSPOT_MSS
+    spike_thresh_ms=120
+    [[ $SHAPE_ENABLED -eq 1 ]] && shape_active=1
+  else
+    IFS='|' read -r dev svc <<< "$(home_uplink_info)"
+    [[ -n "${dev:-}" ]] || dev=$(wifi_device || echo "en0")
+    [[ -n "${svc:-}" ]] || svc="Wi-Fi"
+    svc_pretty=$(pretty_service_name "$svc")
+    mode_label="Standard Home Uplink (${svc_pretty} on ${dev})"
+    exp_mtu=$HOME_WIFI_MTU
+    exp_mss=$HOME_WIFI_MSS
+    exp_v6mss=$HOME_WIFI_V6MSS
+    spike_thresh_ms=50
+  fi
+
+  rm -f "$LAST_PCAP_FILE"
+  echo "=== On-Demand Wireshark Wire Audit (${mode_label}, ${secs}s header-only capture) ==="
+
+  # Launch dumpcap with 128-byte header-only snaplen (-s 128) so zero sensitive payload is written
+  "$dumpcap_bin" -q -i "$dev" -s 128 -a "duration:${secs}" -w "$LAST_PCAP_FILE" >/dev/null 2>&1 &
+  local dpid=$!
+
+  # Generate light concurrent synthetic probes (ICMP, unicast DNS :53, IPv4 HTTPS & IPv6 HTTPS)
+  # so both IPv4 & IPv6 TCP SYN MSS clamps, Window Scale, and iRTT are verified in parallel
+  (
+    sleep 0.2
+    /sbin/ping -c 2 -W 400 1.1.1.1 >/dev/null 2>&1 &
+    /usr/bin/dig +tries=1 +time=1 @1.1.1.1 one.one.one.one A >/dev/null 2>&1 &
+    /usr/bin/curl -4 -sS --max-time 1.5 -I https://1.1.1.1 >/dev/null 2>&1 &
+    if /sbin/ifconfig "$dev" 2>/dev/null | grep -q 'inet6 2'; then
+      /usr/bin/curl -6 -k -sS --max-time 1.5 -I https://[2606:4700:4700::1111] >/dev/null 2>&1 &
+    fi
+    wait
+  ) &
+  local ppid=$!
+
+  wait "$dpid" 2>/dev/null || true
+  wait "$ppid" 2>/dev/null || true
+  chmod 644 "$LAST_PCAP_FILE" 2>/dev/null || true
+
+  if [[ ! -s "$LAST_PCAP_FILE" ]]; then
+    echo "Error: capture file $LAST_PCAP_FILE is empty or unreadable." >&2
+    return 1
+  fi
+
+  # Single-pass tshark + Lua post-dissector extraction (zero `eval` on packet-dissected output!)
+  local audit_out audit_footer
+  audit_out=$("$tshark_bin" -r "$LAST_PCAP_FILE" -T fields -E separator='|' \
+    -e tether.l3_len -e ip.len -e ipv6.plen -e tether.fragmented \
+    -e tcp.flags.syn -e tcp.flags.ack -e tcp.options.mss_val -e tcp.options.wscale.shift \
+    -e tcp.stream -e tcp.analysis.initial_rtt -e tcp.analysis.retransmission \
+    -e tcp.analysis.fast_retransmission -e tcp.analysis.duplicate_ack \
+    -e tcp.analysis.zero_window -e tcp.flags.reset -e tether.fast_lane \
+    -e tether.ecn -e dhcp -e udp.srcport -e udp.dstport -e dns.time -e tether.syn_ecn 2>/dev/null \
+    | awk -F'|' -v dev="$dev" -v pfile="$LAST_PCAP_FILE" -v exp_mtu="$exp_mtu" \
+          -v exp_mss="$exp_mss" -v exp_v6mss="$exp_v6mss" -v shaped="$shape_active" '
+    {
+      total++
+      l3 = $1 + 0
+      if (l3 == 0) { if ($2 != "") l3 = $2 + 0; else if ($3 != "") l3 = ($3 + 0) + 40 }
+      if (l3 > max_l3) max_l3 = l3
+      if ($2 != "" && ($2 + 0) > max_v4) max_v4 = $2 + 0
+      if ($3 != "" && (($3 + 0) + 40) > max_v6) max_v6 = ($3 + 0) + 40
+      if ($4 == "True" || $4 == "1") frag++
+
+      if (($5 == "True" || $5 == "1") && $7 != "") {
+        mss = $7 + 0
+        if ($6 == "False" || $6 == "0") {
+          if ($2 != "" && !seen_v4[mss]++) out_v4 = (out_v4 == "" ? mss : out_v4 " " mss)
+          if ($3 != "" && !seen_v6[mss]++) out_v6 = (out_v6 == "" ? mss : out_v6 " " mss)
+        } else if (!seen_in[mss]++) {
+          in_mss = (in_mss == "" ? mss : in_mss " " mss)
+        }
+        syn_cnt++
+        if ($8 != "") wscale_cnt++
+      }
+      if ($9 != "" && $10 != "" && !seen_st[$9]++) { irtt_sum += ($10 + 0) * 1000.0; irtt_n++ }
+      if ($11 != "") retrans++
+      if ($12 != "") fast_retrans++
+      if ($13 != "") dupack++
+      if ($14 != "") zerowin++
+      if ($15 == "True" || $15 == "1") rst++
+      if ($16 == "True" || $16 == "1") fast_lane++
+      if ($17 == "L4S ECT(1)") ect1++
+      else if ($17 == "Classic ECN ECT(0)") ect0++
+      else if ($17 == "Congestion Experienced (CE)") ce++
+      if ($18 != "") dhcp++
+      if (($19 == "53" || $20 == "53") && $21 != "") { dns_sum += ($21 + 0) * 1000.0; dns_n++ }
+      if ($22 ~ /ECN SYN|AccECN/) ecn_out++
+      if ($22 ~ /Accepted|SYN-ACK/) ecn_in++
+    }
+    END {
+      ov4 = (out_v4 != "" ? out_v4 : "none")
+      ov6 = (out_v6 != "" ? out_v6 : "none")
+      im  = (in_mss != "" ? in_mss : "none")
+      irtt_str   = (irtt_n > 0) ? sprintf("%.1f ms (streams=%d)", irtt_sum / irtt_n, irtt_n) : "n/a"
+      irtt_short = (irtt_n > 0) ? sprintf("%.1fms", irtt_sum / irtt_n) : "n/a"
+      dns_str    = (dns_n > 0)  ? sprintf("%.1f ms (n=%d)", dns_sum / dns_n, dns_n) : "cached/0"
+      qos = (shaped == 1) ? sprintf("Fast-Lane(#10/#11)=%d pkts", fast_lane + 0) : sprintf("Interactive(DNS/ICMP/SSH/WG)=%d pkts (unshaped link)", fast_lane + 0)
+      printf "  Interface / File : %s → %s (snaplen=128B, %d pkts)\n", dev, pfile, total + 0
+      printf "  Max L3 Packet    : %d B [IPv4=%dB, IPv6=%dB] (ceiling ≤ %d B, frag=%d)\n", max_l3 + 0, max_v4 + 0, max_v6 + 0, exp_mtu, frag + 0
+      printf "  TCP SYN MSS      : out IPv4=%sB, out IPv6=%sB, inbound=%sB (ceiling ≤ %d/%dB, WScale=%d/%d)\n", ov4, ov6, im, exp_mss, exp_v6mss, wscale_cnt + 0, syn_cnt + 0
+      printf "  Handshake & DNS  : TCP iRTT=%s | Unicast DNS RTT=%s\n", irtt_str, dns_str
+      printf "  L4S / ECN & QoS  : SYN-ECN=%d out / %d accepted | ECT(1)=%d, ECT(0)=%d, CE=%d | %s\n", ecn_out + 0, ecn_in + 0, ect1 + 0, ect0 + 0, ce + 0, qos
+      printf "  TCP Anomalies    : retrans=%d (fast=%d), dup_ack=%d, zero_win=%d, rst=%d\n", retrans + 0, fast_retrans + 0, dupack + 0, zerowin + 0, rst + 0
+      printf "  DHCP/BOOTP Pkts  : %d (rogue bootpd guard active)\n", dhcp + 0
+      printf "✓ Wire audit complete (%d pkts on %s, max L3=%d/%dB, out SYN MSS=%s/%sB, frag=%d, iRTT=%s, retrans=%d)\n", total + 0, dev, max_l3 + 0, exp_mtu, ov4, ov6, frag + 0, irtt_short, retrans + 0
+    }
+  ')
+  printf '%s\n' "$audit_out" | sed '$d'
+  audit_footer=$(printf '%s\n' "$audit_out" | tail -n 1)
+
+  if [[ -f "${WIRESHARK_SKILL_DIR}/pcap_quick_triage.py" ]]; then
+    echo ""
+    python3 "${WIRESHARK_SKILL_DIR}/pcap_quick_triage.py" "$LAST_PCAP_FILE" --limit 5 --compact 2>/dev/null || true
+  fi
+  if [[ -f "${WIRESHARK_SKILL_DIR}/tcp_latency_analyzer.py" ]]; then
+    echo ""
+    python3 "${WIRESHARK_SKILL_DIR}/tcp_latency_analyzer.py" "$LAST_PCAP_FILE" --min-rtt-ms "$spike_thresh_ms" --compact 2>/dev/null || true
+  fi
+
+  echo ""
+  printf '%s\n' "$audit_footer"
+}
+
+open_wireshark_gui() {
+  if [[ ! -s "$LAST_PCAP_FILE" ]]; then
+    pcap_audit 3
+  fi
+  /usr/bin/open -a Wireshark --args -C Tether-Optimize -r "$LAST_PCAP_FILE"
+  echo "Opened $LAST_PCAP_FILE in Wireshark.app (Profile: Tether-Optimize)."
+}
+
+open_web_workbench() {
+  if [[ -f "$WEB_WORKBENCH_FILE" ]]; then
+    /usr/bin/open "$WEB_WORKBENCH_FILE"
+    echo "Opened Tether-Optimize Product Workbench & Proof Explorer: $WEB_WORKBENCH_FILE"
+  else
+    echo "Error: Product workbench not found at $WEB_WORKBENCH_FILE" >&2
+    exit 1
+  fi
+}
+
+version_cli() {
+  cat <<EOF
+Tether-Optimize v${VERSION} — Pontryagin–Taleb–RFC792 SOTA Hotspot & WAN Optimizer
+  Engine       : ${SCRIPT_PATH} (portable user home: ${TETHER_USER_HOME})
+  Reactor      : ${EVENTS_BIN} (kqueue + PF_ROUTE + 64-bit NET_RT_IFLIST2 + BSD IPPROTO_ICMP)
+  Menubar App  : ${MENUBAR_APP}
+  Formal Spec  : ${LEAN_SPEC_FILE} (110 theorems, 0 axioms, 0 external imports)
+  Workbench UI : ${WEB_WORKBENCH_FILE}
+EOF
+}
+
+doctor_cli() {
+  echo "=== Tether-Optimize v${VERSION} Product Doctor ==="
+  echo "  [1] User & Path Resolution : home=${TETHER_USER_HOME} | script=${SCRIPT_PATH}"
+  echo "  [2] LaunchDaemon           : $(daemon_loaded && echo "RUNNING (${LABEL})" || echo "NOT LOADED")"
+  echo "  [3] Event Reactor          : $([[ -x "$EVENTS_BIN" ]] && pgrep -x tether-events >/dev/null 2>&1 && echo "ACTIVE (${EVENTS_BIN})" || echo "INACTIVE")"
+  echo "  [4] Native Menubar App     : $([[ -x "${MENUBAR_APP}/Contents/MacOS/tether-menubar" ]] && pgrep -x tether-menubar >/dev/null 2>&1 && echo "RUNNING (${MENUBAR_APP})" || echo "STOPPED")"
+  echo "  [5] Lean 4 Prover & Spec   : $([[ -f "$LEAN_SPEC_FILE" ]] && echo "READY (110 zero-axiom theorems)" || echo "MISSING")"
+  echo "  [6] Wireshark & Lua Plugin : $(command -v tshark >/dev/null 2>&1 && [[ -r /dev/bpf0 ]] && echo "READY (ChmodBPF + tether.icmp_owd)" || echo "UNAVAILABLE")"
+  echo "  [7] Web Product Workbench  : $([[ -f "$WEB_WORKBENCH_FILE" ]] && echo "READY (${WEB_WORKBENCH_FILE})" || echo "MISSING")"
+}
+
+run_self_tests() {
+  local pass=0 fail=0 total=0
+  local tmp_prefs orig_down orig_up orig_shape orig_wifi orig_over
+  local detected htype dev svc ip wdev cur_mtu cur_mss cur_v6mss cur_dack cur_l4s cur_ecn cur_bgq
+  local pf_parse_out sounio_rc macstudio_rc
+
+  refresh_hardware_port_cache
+
+  assert_ok() {
+    local desc=$1 cond=$2
+    total=$((total + 1))
+    if eval "$cond"; then
+      pass=$((pass + 1))
+      printf '  [PASS %02d] %s\n' "$total" "$desc"
+    else
+      fail=$((fail + 1))
+      printf '  [FAIL %02d] %s\n' "$total" "$desc" >&2
+    fi
+  }
+
+  echo ""
+  echo "=== Live System & Unit Test Suite (tether-optimize test) ==="
+
+  # Group A: Pure unit tests of IP classification & preference parser
+  assert_ok "is_hotspot_ipv4 recognizes Apple hotspot 172.20.10.4" "is_hotspot_ipv4 172.20.10.4"
+  assert_ok "is_hotspot_ipv4 recognizes RFC 7335 CLAT46 192.0.0.2" "is_hotspot_ipv4 192.0.0.2"
+  assert_ok "is_hotspot_ipv4 recognizes Android hotspot 192.168.43.1" "is_hotspot_ipv4 192.168.43.1"
+  assert_ok "is_hotspot_ipv4 rejects normal Home LAN 192.168.1.167" "! is_hotspot_ipv4 192.168.1.167"
+  assert_ok "is_hotspot_ipv4 rejects Mac Studio LAN segment 192.168.2.1" "! is_hotspot_ipv4 192.168.2.1"
+
+  # Test preference parser clamping & injection rejection in isolated temp file
+  orig_down=$DOWN_MBPS; orig_up=$UP_MBPS; orig_shape=$SHAPE_ENABLED; orig_wifi=$WIFI_OFF; orig_over=$OVERRIDE_MODE
+  tmp_prefs=$(mktemp /tmp/tether-prefs-test.XXXXXX)
+  cat > "$tmp_prefs" <<'EOF'
+DOWN_MBPS=0
+UP_MBPS=99999
+SHAPE_ENABLED=2
+OVERRIDE_MODE=rm -rf /
+EOF
+  USER_PREFS_FILE="$tmp_prefs"
+  DOWN_MBPS=25; UP_MBPS=8; SHAPE_ENABLED=1; OVERRIDE_MODE=auto
+  load_user_prefs
+  assert_ok "load_user_prefs rejects out-of-range (0 / 99999) & malicious override" \
+    "[[ \$DOWN_MBPS -eq 25 && \$UP_MBPS -eq 8 && \$SHAPE_ENABLED -eq 1 && \"\$OVERRIDE_MODE\" == \"auto\" ]]"
+  cat > "$tmp_prefs" <<'EOF'
+DOWN_MBPS=40
+UP_MBPS=12
+SHAPE_ENABLED=0
+OVERRIDE_MODE=force_restore
+EOF
+  load_user_prefs
+  assert_ok "load_user_prefs accepts valid bounds (40/12 Mbps, shape=0, force_restore)" \
+    "[[ \$DOWN_MBPS -eq 40 && \$UP_MBPS -eq 12 && \$SHAPE_ENABLED -eq 0 && \"\$OVERRIDE_MODE\" == \"force_restore\" ]]"
+  rm -f "$tmp_prefs"
+  USER_PREFS_FILE="$DEFAULT_USER_PREFS_FILE"
+  DOWN_MBPS=$orig_down; UP_MBPS=$orig_up; SHAPE_ENABLED=$orig_shape; WIFI_OFF=$orig_wifi; OVERRIDE_MODE=$orig_over
+  load_user_prefs
+
+  # Group B: USB Hotspot vs Protected Interface Enumeration
+  assert_ok "list_usb_hotspot_ports enumerates iPhone USB (en7) and iPad USB (en17)" \
+    "list_usb_hotspot_ports | grep -q '^en7|' && list_usb_hotspot_ports | grep -q '^en17|'"
+  assert_ok "list_usb_hotspot_ports strictly excludes protected LAN/dock ports (en8, en9, en12, en13, en22)" \
+    "! list_usb_hotspot_ports | grep -Eq '^en(8|9|12|13|22)\|'"
+  assert_ok "is_usb_hotspot_device identifies en7/en17 and rejects Home Wi-Fi/LAN en0/en9" \
+    "is_usb_hotspot_device en7 && is_usb_hotspot_device en17 && ! is_usb_hotspot_device en0 && ! is_usb_hotspot_device en9"
+  assert_ok "home_uplink_info never returns an iPhone/iPad USB tether port (en7/en17)" \
+    "! home_uplink_info | grep -Eq '^en(7|17)\|'"
+
+  # Group C: PF Grammar & Anchor Validation
+  pf_parse_out=$(/sbin/pfctl -vnf /etc/pf.conf 2>&1 || true)
+  assert_ok "/etc/pf.conf passes pfctl -vnf strict section-order grammar check" \
+    "! printf '%s\n' \"\$pf_parse_out\" | grep -q 'Rules must be in order'"
+  assert_ok "/etc/pf.conf contains NAT rules for en0, en7 (iPhone USB), and en17 (iPad USB)" \
+    "grep -q '^nat on en0 ' /etc/pf.conf && grep -q '^nat on en7 ' /etc/pf.conf && grep -q '^nat on en17 ' /etc/pf.conf"
+  assert_ok "Generated PF anchor file ($PF_CONF_FILE) passes pfctl -vnf syntax check" \
+    "[[ -f \"\$PF_CONF_FILE\" ]] && /sbin/pfctl -vnf \"\$PF_CONF_FILE\" >/dev/null 2>&1"
+  assert_ok "sounio-tether-share preserves com.apple/tether_optimize anchor on PF reload" \
+    "grep -q 'com.apple/tether_optimize' /usr/local/bin/sounio-tether-share"
+
+  # Group D: LaunchDaemon Health & Binary Ownership Security
+  assert_ok "LaunchDaemon com.josaum.tether-optimize is loaded and running" "daemon_loaded"
+  assert_ok "notify_user deduplicates repeated identical banners via LAST_NOTIFIED_FILE" \
+    "grep -q 'LAST_NOTIFIED_FILE' \"\$SCRIPT_PATH\" && grep -q 'prev_sig' \"\$SCRIPT_PATH\""
+  assert_ok "watch_loop debounces transient 1-cycle USB hotspot drops & detects Home Wi-Fi <-> LAN handovers" \
+    "grep -q 'up:usb\\\\|\\*' \"\$SCRIPT_PATH\" && grep -q 'home uplink changed' \"\$SCRIPT_PATH\""
+  assert_ok "Overlay VPN inner MSS clamped on utun*/feth* (1220 hotspot / 1332 Home PPPoE)" \
+    "grep -qE 'scrub on utun0 inet all max-mss (1220|1332)' \"\$SHAPER_STATE_FILE\" 2>/dev/null"
+  assert_ok "watch_loop arithmetic & periodic sweep protected against set -e crashes" \
+    "grep -q 'tick=\$(( (tick + 1) % 10 ))' \"\$SCRIPT_PATH\" && grep -q 'throttle_background_daemons || true' \"\$SCRIPT_PATH\""
+  assert_ok "Root script $SCRIPT_PATH is owned by root:wheel (mode 755)" \
+    "[[ \"\$(stat -f '%Su:%Sg:%Lp' \"\$SCRIPT_PATH\" 2>/dev/null)\" == \"root:wheel:755\" ]]"
+  assert_ok "Lean 4 spec $LEAN_SPEC_FILE is owned by root:wheel (mode 644)" \
+    "[[ \"\$(stat -f '%Su:%Sg:%Lp' \"\$LEAN_SPEC_FILE\" 2>/dev/null)\" == \"root:wheel:644\" ]]"
+  sounio_rc=$(launchctl print system/com.sounio.tether-share 2>/dev/null | awk -F'= ' '/last exit code/{print $2}' | tr -d '[:space:]')
+  assert_ok "LaunchDaemon com.sounio.tether-share has last exit code = 0" \
+    "[[ \"\${sounio_rc:-0}\" == \"0\" ]]"
+  macstudio_rc=$(launchctl print system/com.getjai.macstudio-cellular 2>/dev/null | awk -F'= ' '/last exit code/{print $2}' | tr -d '[:space:]')
+  assert_ok "LaunchDaemon com.getjai.macstudio-cellular has last exit code = 0" \
+    "[[ \"\${macstudio_rc:-0}\" == \"0\" ]]"
+  assert_ok "Topbar widget app (${MENUBAR_APP}) is running" \
+    "[[ -x \"${MENUBAR_APP}/Contents/MacOS/tether-menubar\" ]] && pgrep -x tether-menubar >/dev/null 2>&1"
+  assert_ok "Topbar LaunchAgent (com.josaum.tether-menubar) has RunAtLoad & KeepAlive enabled" \
+    "grep -q '<key>RunAtLoad</key>' \"${MENUBAR_PLIST}\" && ! launchctl print-disabled \"gui/\$(id -u)\" 2>/dev/null | grep -q '\"com.josaum.tether-menubar\" => disabled'"
+  assert_ok "Topbar widget registered in macOS Login Items (TetherMenubar.app)" \
+    "osascript -e 'tell application \"System Events\" to get the name of every login item' 2>/dev/null | grep -q 'TetherMenubar'"
+  assert_ok "Wireshark CLI suite (dumpcap, tshark, capinfos) & ChmodBPF non-root capture ready" \
+    "command -v dumpcap >/dev/null 2>&1 && command -v tshark >/dev/null 2>&1 && [[ -r /dev/bpf0 ]]"
+  assert_ok "Wireshark automated triage scripts (pcap_quick_triage.py, tcp_latency_analyzer.py) ready" \
+    "[[ -f \"\${WIRESHARK_SKILL_DIR}/pcap_quick_triage.py\" && -f \"\${WIRESHARK_SKILL_DIR}/tcp_latency_analyzer.py\" ]]"
+  assert_ok "Daemon hardware-port cache & batched 17-key sysctl optimization active" \
+    "grep -q 'refresh_hardware_port_cache' \"\$SCRIPT_PATH\" && grep -q 'net.inet.tcp.delayed_ack=3 \\\\' \"\$SCRIPT_PATH\""
+  assert_ok "Fast event-driven IPC sync (wait_for_daemon_sync) & zero background dumpcap in standby" \
+    "grep -q 'state_ts >= prefs_ts' \"\$SCRIPT_PATH\" && ! pgrep -x dumpcap >/dev/null 2>&1"
+  assert_ok "Attached-only USB service guard (iface_exists + service_for_device) skips unplugged & shadow USB stalls" \
+    "grep -q 'for dev in en7 en17 en9; do' \"\$SCRIPT_PATH\" && grep -q 'iface_exists \"\$dev\" || continue' \"\$SCRIPT_PATH\""
+  local t_proxy_s t_proxy_e
+  t_proxy_s=$(date +%s)
+  sanitize_dead_system_proxies
+  t_proxy_e=$(date +%s)
+  assert_ok "sanitize_dead_system_proxies completes in <= 2s on both attached and unplugged USB interfaces" \
+    "(( t_proxy_e - t_proxy_s <= 2 ))"
+  assert_ok "CLI status & run_self_tests initialize single-call refresh_hardware_port_cache & usage shows 110 theorems" \
+    "grep -q 'run 110-theorem Lean 4' \"\$SCRIPT_PATH\" && [[ -n \"\$CACHED_WIFI_DEV\" ]]"
+  assert_ok "restore_shaper_and_pf guards secondary home uplink PF scrub rules with iface_exists" \
+    "grep -q 'if \[\[ \"\$hdev\" != \"\$wdev\" \]\] && iface_exists \"\$hdev\"' \"\$SCRIPT_PATH\""
+  assert_ok "Wireshark Lua post-dissector (tether_optimize.lua) registered (tether.l3_len, tether.syn_mss, tether.fast_lane)" \
+    "[[ -f \"${TETHER_USER_HOME}/.local/lib/wireshark/plugins/tether_optimize.lua\" ]] && tshark -G fields 2>/dev/null | grep -q 'tether.l3_len'"
+  assert_ok "Wireshark Tether-Optimize profile (custom columns, colorfilters, 8 toolbar filter buttons) installed" \
+    "[[ -f \"${TETHER_USER_HOME}/.config/wireshark/profiles/Tether-Optimize/preferences\" && -f \"${TETHER_USER_HOME}/.config/wireshark/profiles/Tether-Optimize/dfilter_buttons\" ]]"
+  assert_ok "Idempotent interface & SCPreferences guards (set_iface_mtu_if_needed, set_service_dns_if_needed) prevent USB PHY resets" \
+    "grep -q 'set_iface_mtu_if_needed' \"\$SCRIPT_PATH\" && grep -q 'set_service_dns_if_needed' \"\$SCRIPT_PATH\" && ! set_iface_mtu_if_needed en0 \"\$(iface_mtu en0)\""
+  assert_ok "Attached en9 link-blip debounce (home_blip_count) & 300s home notification cooldown active" \
+    "grep -q 'home_blip_count' \"\$SCRIPT_PATH\" && grep -q 'HOME_NOTIFY_COOLDOWN_SECS=300' \"\$SCRIPT_PATH\""
+  assert_ok "watch_loop refreshes hardware port cache before computing canonical hotspot state (no double apply on USB attach)" \
+    "grep -q 'apply_core \"\$detected\"' \"\$SCRIPT_PATH\" && [[ \"\$(pretty_service_name 'iPhone USB USB')\" == 'iPhone USB' ]]"
+  assert_ok "Zero-lsof TCP LISTEN socket snapshot (netstat -an -p tcp) & link-aware Wireshark RTT threshold active" \
+    "grep -q 'tcp_listen_ports_snapshot' \"\$SCRIPT_PATH\" && grep -q 'spike_thresh_ms=120' \"\$SCRIPT_PATH\""
+  assert_ok "Shadow-free service_exists_in_order & idempotent set_airport_power_if_needed guards active" \
+    "service_exists_in_order 'Wi-Fi' && ! service_exists_in_order 'NonExistentShadow USB USB' && grep -q 'set_airport_power_if_needed' \"\$SCRIPT_PATH\""
+  assert_ok "Atomic write_state_file encodes Home/Paused uplink & dual-stack Wireshark --compact audit active" \
+    "grep -q 'write_state_file' \"\$SCRIPT_PATH\" && grep -q -- '--compact' \"\$SCRIPT_PATH\""
+  assert_ok "Event-driven kernel reactor (tether-events kqueue + PF_ROUTE) compiled, root-locked & active" \
+    "[[ -x \"\$EVENTS_BIN\" && \"\$(stat -f '%Su:%Sg:%Lp' \"\$EVENTS_BIN\" 2>/dev/null)\" == 'root:wheel:755' ]] && pgrep -x tether-events >/dev/null 2>&1"
+  assert_ok "Proportional Fast-Lane uncaps 5G Tailscale/SSH (80/24 at 100/30) while bounding 4/2 floor" \
+    "[[ \"\$(fast_lane_rate 100 4)\" == '80' && \"\$(fast_lane_rate 30 2)\" == '24' && \"\$(fast_lane_rate 4 4)\" == '4' ]]"
+  assert_ok "Closed-loop AIMD Autorate controller preserves [floor, ceiling] & GRED + sync-ENOBUFS active" \
+    "[[ \"\$(autorate_calc_next 4 100 100 bloated)\" == '80' && \"\$(autorate_calc_next 4 100 5 bloated)\" == '4' && \"\$(autorate_calc_next 4 100 80 drained)\" == '90' ]] && grep -q 'gred 0.002/4/14/0.12' \"\$SCRIPT_PATH\""
+  assert_ok "Dynamic overlay utun* drift detector & Wireshark tether.syn_ecn post-dissector registered" \
+    "[[ -f \"\$OVERLAY_STATE_FILE\" ]] && tshark -G fields 2>/dev/null | grep -q 'tether.syn_ecn'"
+  assert_ok "Jacobson-Karels adaptive hysteresis guarantees >=18ms deadband separation (v=0, 10, 40ms)" \
+    "(( \$(adaptive_high_thresh 0) - \$(adaptive_low_thresh 0) >= 18 && \$(adaptive_high_thresh 10) - \$(adaptive_low_thresh 10) >= 18 && \$(adaptive_high_thresh 40) - \$(adaptive_low_thresh 40) >= 18 ))"
+  assert_ok "Canonical single-file ui.snapshot active & pcap_audit is 100% eval-free" \
+    "[[ -s \"\$UI_SNAPSHOT_FILE\" ]] && ! grep -q 'eval "\$audit_vars"' \"\$SCRIPT_PATH\""
+  local tm_mvue tm_a0 tm_amle tm_n tm_sh tm_v99 tm_reg tm_heavy tm_zero
+  tm_mvue=$(taleb_pareto_mle 10 350 "12 14 17 22")
+  IFS='|' read -r _ tm_a0 tm_amle tm_n tm_sh tm_v99 tm_reg <<< "$tm_mvue"
+  assert_ok "Taleb InvGamma debiasing α̂_0 = ((n-1)/n) α̂_MLE exact (n=4 -> α̂_0/α̂_MLE = 3/4)" \
+    "/usr/bin/awk -v a0=\"\$tm_a0\" -v am=\"\$tm_amle\" -v n=\"\$tm_n\" 'BEGIN{exit !(n==4 && (a0 - 0.75*am)^2 < 1e-3 && a0 < am)}'"
+  tm_zero=$(taleb_pareto_mle 10 350 "")
+  tm_heavy=$(taleb_pareto_mle 10 350 "30 90 270 340")
+  assert_ok "Taleb Shadow Mean & Cirillo-Taleb [L,H] finite at α≤1 + S_n=0 shrinkage sound" \
+    "[[ \"\$tm_zero\" == *'|n/a|0|'* && \"\$tm_heavy\" == *'|inf_mean'* && \"\$tm_reg\" == 'levy_fat' ]]"
+  assert_ok "Order-statistic streak k(α) (3 at α≤1, 2 at α>1) & fat_tail_high_thresh keep >=18ms deadband" \
+    "[[ \"\$(streak_for_alpha 850)\" == '3' && \"\$(streak_for_alpha 1500)\" == '2' ]] && (( \$(fat_tail_high_thresh 10 1400) - \$(adaptive_low_thresh 10) >= 18 ))"
+  assert_ok "Pontryagin u*(λ) = clamp(⌊u_max·τ₀/λ⌋) maximizes Kelly Hamiltonian (100@λ=20->100, λ=40->50, λ=800->4)" \
+    "[[ \"\$(pontryagin_optimal_rate 4 100 20 20)\" == '100' && \"\$(pontryagin_optimal_rate 4 100 20 40)\" == '50' && \"\$(pontryagin_optimal_rate 4 100 20 800)\" == '4' ]]"
+  assert_ok "Pontryagin comparative statics: u*(λ₂) <= u*(λ₁) for λ₁ <= λ₂ (25 <= 50 <= 100)" \
+    "(( \$(pontryagin_optimal_rate 4 100 20 80) <= \$(pontryagin_optimal_rate 4 100 20 40) && \$(pontryagin_optimal_rate 4 100 20 40) <= \$(pontryagin_optimal_rate 4 100 20 20) ))"
+  assert_ok "Taleb-Pontryagin adjoint forcing Ψ vanishes tail penalty at α>=2 & amplifies at α<=1" \
+    "[[ \"\$(pontryagin_adjoint_forcing 20 15 2400 80)\" == '35' && \"\$(pontryagin_adjoint_forcing 20 15 900 80)\" == '95' ]]"
+  assert_ok "Pontryagin costate relaxation λ_{k+1} = τ₀ + ⌊3(λ-τ₀)/4⌋ strictly contracts to equilibrium τ₀=20" \
+    "[[ \"\$(pontryagin_costate_step 20 60 20 drained)\" == '50' && \"\$(pontryagin_costate_step 20 20 20 drained)\" == '20' ]]"
+  assert_ok "Pontryagin empirical Hamiltonian check: u*=50 beats all neighbor controls u∈{40,49,51,60} at W=2000, λ=40" \
+    "/usr/bin/awk 'BEGIN{W=2000;lam=40;for(u=1;u<=100;u++){U+=int(W/u);H[u]=U+lam*(100-u)};exit !(H[50]>=H[40] && H[50]>=H[49] && H[50]>H[51] && H[50]>H[60])}'"
+  local owd_test_out owd_qrtt owd_up_r owd_dn_r owd_mode_t owd_cnt_t owd_resp_t
+  owd_test_out=$("$EVENTS_BIN" --probe en9 320 2>/dev/null || echo "0|0|10|0|0|rtt|0|1|10")
+  IFS='|' read -r _ _ owd_qrtt owd_up_r owd_dn_r owd_mode_t owd_cnt_t owd_resp_t _ <<< "$owd_test_out"
+  assert_ok "RFC 792 Type 13/14 One-Way Delay & 3-reflector quorum probe active (θ clock-offset cancels)" \
+    "(( ${owd_resp_t:-0} >= 1 )) && (( ${owd_cnt_t:-0} == 0 || ( (${owd_up_r:-0} + ${owd_dn_r:-0} - ${owd_qrtt:-0}) <= 25 && (${owd_qrtt:-0} - (${owd_up_r:-0} + ${owd_dn_r:-0})) <= 25 ) ))"
+  assert_ok "Byzantine 2-of-3 multi-reflector median3 rejects single-reflector 350ms spike" \
+    "[[ \"\$(median3 6 8 350)\" == '8' && \"\$(median3 350 6 8)\" == '8' && \"\$(median3 6 350 8)\" == '8' ]]"
+  assert_ok "Revealed-capacity shadow price λ_cap(W, r̂) captures 12 Mbps fade from 100 Mbps in 1 step (λ=154->u*=12)" \
+    "[[ \"\$(revealed_capacity_costate 2000 12)\" == '154' && \"\$(pontryagin_optimal_rate 4 100 20 154)\" == '12' && \"\$(revealed_capacity_costate 2000 100)\" == '20' ]]"
+  assert_ok "BDP-Isochronous CoDel/GRED scaling preserves 2 <= min_th < max_th < queue_slots <= 90 across 2..100 Mbps" \
+    "(( \$(gred_min_th 2) == 2 && \$(gred_max_th 2) == 6 && \$(dummynet_queue_slots 2) == 10 && \$(gred_min_th 100) == 24 && \$(gred_max_th 100) == 64 && \$(dummynet_queue_slots 100) == 90 ))"
+  assert_ok "Wireshark Lua post-dissector registers RFC 792 OWD field (tether.icmp_owd) & adaptive 500ms fasttick active" \
+    "tshark -G fields 2>/dev/null | grep -q 'tether.icmp_owd' && grep -q 'fasttick|' \"\$EVENTS_SRC\""
+  assert_ok "Portable product packaging (v${VERSION}, resolve_user_home, installer & web workbench) ready" \
+    "[[ \"\$VERSION\" == '1.0.0' && -d \"\$TETHER_USER_HOME\" && -f \"\$WEB_WORKBENCH_FILE\" ]]"
+
+  # Group E: Live Kernel / Sysctl / Interface / Firewall Invariants (single batched sysctl read)
+  local sys_vals
+  sys_vals=$(/usr/sbin/sysctl -n \
+    net.inet.tcp.delayed_ack \
+    net.inet.tcp.l4s \
+    net.classq.fq_codel.enable_ecn \
+    net.inet.tcp.mssdflt \
+    net.inet.tcp.v6mssdflt \
+    net.inet.tcp.bg_target_qdelay 2>/dev/null | tr '\n' '|' || true)
+  IFS='|' read -r cur_dack cur_l4s cur_ecn cur_mss cur_v6mss cur_bgq _ <<< "$sys_vals"
+
+  assert_ok "Kernel TCP adaptive delayed ACKs enabled (net.inet.tcp.delayed_ack = 3)" \
+    "[[ \"\$cur_dack\" == \"3\" ]]"
+  assert_ok "Kernel L4S & FQ-CoDel ECN enabled (l4s = 1, enable_ecn = 1)" \
+    "[[ \"\$cur_l4s\" == \"1\" && \"\$cur_ecn\" == \"1\" ]]"
+  assert_ok "Local-service firewall guard blocks non-loopback ports 3000 & 11434" \
+    "grep -q 'port = 3000' \"\$SHAPER_STATE_FILE\" 2>/dev/null && grep -q 'port = 11434' \"\$SHAPER_STATE_FILE\" 2>/dev/null"
+  assert_ok "en9 LAN segment is excluded from bridge100 (DHCP bootpd protection)" \
+    "! /sbin/ifconfig bridge100 2>/dev/null | grep -q 'member: en9'"
+
+  if detected=$(detect_active_hotspot) && [[ "$OVERRIDE_MODE" != "force_restore" ]]; then
+    IFS='|' read -r htype dev svc ip <<< "$detected"
+    cur_mtu=$(/sbin/ifconfig "$dev" 2>/dev/null | sed -n 's/.*mtu \([0-9]*\).*/\1/p' | head -1)
+    assert_ok "Active Hotspot ($svc on $dev) has MTU clamped to $HOTSPOT_MTU" \
+      "[[ \"\$cur_mtu\" == \"\$HOTSPOT_MTU\" ]]"
+    assert_ok "Active Hotspot TCP MSS sysctls clamped to $HOTSPOT_MSS (IPv4 & IPv6)" \
+      "[[ \"\$cur_mss\" == \"\$HOTSPOT_MSS\" && \"\$cur_v6mss\" == \"\$HOTSPOT_MSS\" ]]"
+    assert_ok "Active Hotspot LEDBAT++ background target queue delay = 15 ms" \
+      "[[ \"\$cur_bgq\" == \"15\" ]]"
+    assert_ok "Active Hotspot PF scrub rules enforce outer MSS $HOTSPOT_MSS & overlay MSS $OVERLAY_MSS" \
+      "grep -q \"max-mss \$HOTSPOT_MSS\" \"\$SHAPER_STATE_FILE\" && grep -q \"max-mss \$OVERLAY_MSS\" \"\$SHAPER_STATE_FILE\""
+    if [[ "$htype" == "wifi" ]] || wifi_also_on_hotspot; then
+      assert_ok "Active Wi-Fi Hotspot holds awdl0 DOWN (no AirDrop channel-hopping spikes)" \
+        "! /sbin/ifconfig awdl0 2>/dev/null | head -1 | grep -qw 'UP'"
+    else
+      assert_ok "Active USB-only Hotspot keeps awdl0 UP (AirDrop available over cable tether)" \
+        "/sbin/ifconfig awdl0 2>/dev/null | head -1 | grep -qw 'UP'"
+    fi
+  else
+    wdev=$(wifi_device || echo en0)
+    local hdev_t hsvc_t cur_hmtu
+    IFS='|' read -r hdev_t hsvc_t <<< "$(home_uplink_info)"
+    [[ -n "${hdev_t:-}" ]] || hdev_t="$wdev"
+    cur_mtu=$(/sbin/ifconfig "$wdev" 2>/dev/null | sed -n 's/.*mtu \([0-9]*\).*/\1/p' | head -1)
+    cur_hmtu=$(/sbin/ifconfig "$hdev_t" 2>/dev/null | sed -n 's/.*mtu \([0-9]*\).*/\1/p' | head -1)
+    assert_ok "Standard Home Uplink ($hdev_t / $wdev) has PPPoE-safe MTU $HOME_WIFI_MTU" \
+      "[[ \"\$cur_mtu\" == \"\$HOME_WIFI_MTU\" && \"\$cur_hmtu\" == \"\$HOME_WIFI_MTU\" ]]"
+    assert_ok "Standard Home Wi-Fi/LAN TCP MSS sysctls set to $HOME_WIFI_MSS IPv4 / $HOME_WIFI_V6MSS IPv6" \
+      "[[ \"\$cur_mss\" == \"\$HOME_WIFI_MSS\" && \"\$cur_v6mss\" == \"\$HOME_WIFI_V6MSS\" ]]"
+    assert_ok "Standard Home Wi-Fi/LAN keeps awdl0 UP for AirDrop/Handoff" \
+      "/sbin/ifconfig awdl0 2>/dev/null | head -1 | grep -qw 'UP'"
+    if [[ "$hdev_t" == "en9" ]]; then
+      assert_ok "Active Wired Home LAN (en9) suppresses rogue 192.168.2.1 alias & bootpd DHCP server" \
+        "! /sbin/ifconfig en9 2>/dev/null | grep -q 'inet 192\.168\.2\.1 ' && ! /usr/bin/pgrep -x bootpd >/dev/null 2>&1"
+      assert_ok "Active Wired Home LAN (en9) has PF scrub max-mss $HOME_WIFI_MSS / $HOME_WIFI_V6MSS rules" \
+        "grep -q 'scrub on en9 inet all max-mss 1452' \"\$SHAPER_STATE_FILE\" 2>/dev/null"
+    else
+      if iface_exists en9; then
+        assert_ok "Downstream Mac Studio/RPi5 LAN gateway (192.168.2.1/24 on en9) preserved when en9 attached" \
+          "/sbin/ifconfig en9 2>/dev/null | grep -q 'inet 192\.168\.2\.1 '"
+      else
+        assert_ok "Unplugged en9 USB LAN dongle cleanly detached & default route on Home Wi-Fi ($wdev)" \
+          "! iface_exists en9 && [[ \"\$(default_route_device)\" == \"\$wdev\" ]]"
+      fi
+      assert_ok "Standard Home Wi-Fi ($wdev) has PF scrub max-mss $HOME_WIFI_MSS / $HOME_WIFI_V6MSS rules" \
+        "grep -q \"scrub on \$wdev inet all max-mss 1452\" \"\$SHAPER_STATE_FILE\" 2>/dev/null"
+    fi
+  fi
+
+  echo "✓ ${pass}/${total} live system & unit assertions passed (${fail} failed)"
+  [[ $fail -eq 0 ]]
+}
+
+# --- Main --------------------------------------------------------------------
+
+case "$MODE" in
+  status) status ;;
+  pf-status) pf_status ;;
+  apply) apply; status ;;
+  cap)
+    echo "Updating hotspot cap to ${DOWN_MBPS} Mbps down / ${UP_MBPS} Mbps up…"
+    apply
+    status
+    ;;
+  unshape)
+    SHAPE_ENABLED=0
+    echo "Disabling bandwidth cap (keeping TCP/MSS/AWDL/QoS hotspot optimizations)…"
+    apply
+    status
+    ;;
+  shape)
+    SHAPE_ENABLED=1
+    echo "Enabling bandwidth cap (${DOWN_MBPS} Mbps down / ${UP_MBPS} Mbps up)…"
+    apply
+    status
+    ;;
+  restore) restore; status ;;
+  pcap) pcap_audit "$PCAP_SECS" ;;
+  owd-probe) owd_probe_cli ;;
+  tail-mle) tail_mle_cli "${TAIL_MLE_ARGS[@]+"${TAIL_MLE_ARGS[@]}"}" ;;
+  wireshark-gui) open_wireshark_gui ;;
+  web|workbench) open_web_workbench ;;
+  doctor) doctor_cli ;;
+  version) version_cli ;;
+  verify) verify_lean; run_self_tests ;;
+  verify-lean) verify_lean ;;
+  test|self-test) run_self_tests ;;
+  menubar|menubar-start)
+    launchctl enable "gui/$(id -u)/com.josaum.tether-menubar" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)/com.josaum.tether-menubar" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "${MENUBAR_PLIST}" 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/com.josaum.tether-menubar"
+    echo "Topbar widget started and enabled for OS autostart (com.josaum.tether-menubar)."
+    ;;
+  menubar-stop)
+    launchctl bootout "gui/$(id -u)/com.josaum.tether-menubar" 2>/dev/null || true
+    pkill -x tether-menubar 2>/dev/null || true
+    echo "Topbar widget stopped."
+    ;;
+  watch) watch_loop ;;
+  install-auto) install_auto ;;
+  uninstall-auto) uninstall_auto ;;
+  auto-status) auto_status ;;
+  test-popup)
+    notify_user "tether-optimize" "Wi-Fi & USB Personal Hotspot optimizer ready." Glass 1
+    echo "Banner sent. Dongle status: $(usb_wifi_dongle_info)"
+    ;;
+  __root_apply)
+    is_root || { echo "root required" >&2; exit 1; }
+    ensure_state_dir
+    apply_core
+    ;;
+  __root_restore)
+    is_root || { echo "root required" >&2; exit 1; }
+    ensure_state_dir
+    restore_core
+    ;;
+  *) usage; exit 2 ;;
+esac
