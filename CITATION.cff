@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use Mirabilis-Tether or its Lean 4 formal specification in your research or systems work, please cite it as below."
+title: "Mirabilis-Tether: Formally Verified Cellular Hotspot Control via Pontryagin's Maximum Principle, Inverse-Gamma Fat-Tail Debiasing, and Clock-Offset-Cancelled One-Way Delay"
+version: 1.0.0
+doi: 10.5281/zenodo.24100456
+date-released: 2026-11-10
+url: "https://github.com/josaum/mirabilis-tether"
+repository-code: "https://github.com/josaum/mirabilis-tether"
+license: MIT
+authors:
+  - family-names: "Agourakis"
+    given-names: "Dionisio Chiuratto"
+    email: "dionisio.ca@gmail.com"
+    orcid: "https://orcid.org/0009-0000-4863-9143"
+keywords:
+  - lean4
+  - formal-verification
+  - pontryagin-maximum-principle
+  - fat-tails
+  - inverse-gamma
+  - bufferbloat
+  - rfc792-owd
+  - macos-xnu

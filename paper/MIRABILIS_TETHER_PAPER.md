@@ -1,6 +1,6 @@
 # Mirabilis-Tether: Formally Verified Cellular Hotspot Control via Pontryagin's Maximum Principle, Inverse-Gamma Fat-Tail Debiasing, and Clock-Offset-Cancelled One-Way Delay
 
-**Author:** J. Saum · **Repository:** [`github.com/josaum/mirabilis-tether`](https://github.com/josaum/mirabilis-tether) · **PDF Edition:** [`paper/mirabilis_tether.pdf`](mirabilis_tether.pdf) · **Version:** 1.0.0 (November 2026)
+**Author:** Dionisio Chiuratto Agourakis (`dionisio.ca@gmail.com` · ORCID: [`0009-0000-4863-9143`](https://orcid.org/0009-0000-4863-9143)) · **DOI:** [`10.5281/zenodo.24100456`](https://doi.org/10.5281/zenodo.24100456) · **Repository:** [`github.com/josaum/mirabilis-tether`](https://github.com/josaum/mirabilis-tether) · **PDF Edition:** [`paper/mirabilis_tether.pdf`](mirabilis_tether.pdf) · **Version:** 1.0.0 (November 2026)
 
 ---
 

@@ -1,10 +1,12 @@
 # Mirabilis-Tether (`tether-optimize` v1.0.0)
 ### *Mirabilis Abbreviatio* — Formally Verified macOS Personal Hotspot & WAN Optimizer
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24100456.svg)](https://doi.org/10.5281/zenodo.24100456)
 [![Lean 4 Kernel Verified](https://img.shields.io/badge/Lean_4-110_Theorems_(0_Axioms)-3fb950)](proofs/TetherOptimizeSpec.lean)
 [![Live Assertions](https://img.shields.io/badge/Live_Assertions-72%2F72_Passing-58a6ff)](bin/tether-optimize)
 [![macOS Platform](https://img.shields.io/badge/macOS-Apple_Silicon_%26_XNU-bc8cff)](https://github.com/josaum/mirabilis-tether)
 [![Research Paper](https://img.shields.io/badge/Paper-PDF_%26_LaTeX-f0883e)](paper/mirabilis_tether.pdf)
+[![ORCID](https://img.shields.io/badge/ORCID-0009--0000--4863--9143-a6ce39)](https://orcid.org/0009-0000-4863-9143)
 
 **Mirabilis-Tether** (`tether-optimize`) is an event-driven macOS kernel optimization product and native Menu Bar suite that eliminates cellular baseband bufferbloat, Wi-Fi `awdl0` channel-hopping stutters, GTP-U/CLAT46 packet fragmentation, and background sync saturation when tethered to an iPhone, iPad, or Android Personal Hotspot (over Wi-Fi `en0` or USB `en7`/`en17`), while automatically restoring unshaped PPPoE-safe Gigabit Home Wi-Fi/LAN settings on disconnect.
 
@@ -175,3 +177,25 @@ To independently verify the entire mathematical specification and live kernel in
 - **Unplugged or Flapping USB Cable**: Debounced across `1.5s` transient USB resets (`watch_loop`) and guarded by `iface_exists` before touching `networksetup` or `ifconfig`.
 - **ICMP Timestamp Filtered by Carrier**: If a cellular carrier strips RFC 792 Type 13/14 messages or returns non-conserving timestamps (`|(d̃_↑ + d̃_↓) - RTT| > 25 ms`), `tether-events` automatically falls back to `mode=rtt` using the `median3` Echo quorum and directional byte-activity guards.
 - **Hot-Reload Without `sudo`**: When the root `com.josaum.tether-optimize` LaunchDaemon is running, atomic replacement (`mv -f`) of `~/bin/tether-optimize` triggers `EVFILT_VNODE`, causing the daemon to re-lock ownership to `root:wheel` and `exec` the new script automatically.
+
+---
+
+## 8. Citation & Publication Metadata
+
+- **Author:** Dionisio Chiuratto Agourakis (`dionisio.ca@gmail.com`)
+- **ORCID:** [`0009-0000-4863-9143`](https://orcid.org/0009-0000-4863-9143)
+- **Zenodo DOI:** [`10.5281/zenodo.24100456`](https://doi.org/10.5281/zenodo.24100456) (Concept DOI: [`10.5281/zenodo.24100455`](https://doi.org/10.5281/zenodo.24100455))
+
+```bibtex
+@article{agourakis2026mirabilis,
+  author       = {Agourakis, Dionisio Chiuratto},
+  title        = {{Mirabilis-Tether: Formally Verified Cellular Hotspot Control via Pontryagin's Maximum Principle, Inverse-Gamma Fat-Tail Debiasing, and Clock-Offset-Cancelled One-Way Delay}},
+  year         = {2026},
+  month        = nov,
+  publisher    = {Zenodo},
+  version      = {1.0.0},
+  doi          = {10.5281/zenodo.24100456},
+  url          = {https://doi.org/10.5281/zenodo.24100456}
+}
+```
+
