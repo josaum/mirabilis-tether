@@ -449,9 +449,14 @@ is_usb_hotspot_device() {
 # Strictly excludes iPhone/iPad USB hotspot devices (en7, en17) so a stale default route
 # during cable unplug never misclassifies a USB tether port as a Home LAN interface.
 home_uplink_info() {
-  local def_dev wdev svc en9_up_ip
+  local def_dev wdev w_ip svc en9_up_ip
   wdev=$(wifi_device || echo "en0")
   [[ -n "$wdev" ]] || wdev="en0"
+  w_ip=$(iface_ipv4 "$wdev" || true)
+  if [[ -n "${w_ip:-}" && ! "$w_ip" =~ ^169\.254\. ]] && ! is_hotspot_ipv4 "$w_ip" && ! iface_is_constrained "$wdev"; then
+    printf '%s|Wi-Fi\n' "$wdev"
+    return 0
+  fi
   en9_up_ip=$(/sbin/ifconfig en9 2>/dev/null | awk '/inet / && $2 !~ /^(192\.168\.2\.|169\.254\.)/ { print $2; exit }')
   if [[ -n "${en9_up_ip:-}" ]]; then
     svc=$(service_for_device "en9" || true)
@@ -1404,8 +1409,18 @@ restore_core() {
   #   • Primary service order: active home uplink first (or Wi-Fi) — idempotent, skips SCPreferences write if already #1
   #   • MTU 1492 on en0 and active home LAN uplink — idempotent, skips SIOCSIFMTU if already 1492 so en9 USB PHY never resets!
   #   • Fast public DNS (1.1.1.1 / 1.0.0.1 / 8.8.8.8 / 8.8.4.4) + local router fallback (192.168.15.1 / 192.168.1.1)
+  set_airport_power_if_needed "$wdev" on || true
   if order_services_if_needed "$hsvc"; then
     sc_changed=1
+  fi
+  if [[ "$hdev" == "$wdev" && "$(default_route_device || true)" != "$wdev" ]]; then
+    local w_gw
+    w_gw=$(/usr/sbin/networksetup -getinfo "Wi-Fi" 2>/dev/null | awk -F': ' '/^Router:/{print $2; exit}')
+    if [[ -n "${w_gw:-}" && "$w_gw" != "none" ]]; then
+      /sbin/route -n delete default >/dev/null 2>&1 || true
+      /sbin/route -n add default "$w_gw" -ifscope "$wdev" >/dev/null 2>&1 || /sbin/route -n add default "$w_gw" >/dev/null 2>&1 || true
+      sc_changed=1
+    fi
   fi
   set_iface_mtu_if_needed "$wdev" "$HOME_WIFI_MTU" || true
   [[ "$hdev" != "$wdev" ]] && iface_exists "$hdev" && { set_iface_mtu_if_needed "$hdev" "$HOME_WIFI_MTU" || true; }
@@ -2767,8 +2782,8 @@ EOF
         "grep -q 'scrub on en9 inet all max-mss 1452' \"\$SHAPER_STATE_FILE\" 2>/dev/null"
     else
       if iface_exists en9; then
-        assert_ok "Downstream Mac Studio/RPi5 LAN gateway (192.168.2.1/24 on en9) preserved when en9 attached" \
-          "/sbin/ifconfig en9 2>/dev/null | grep -q 'inet 192\.168\.2\.1 '"
+        assert_ok "Attached en9 LAN interface is clean (upstream LAN without rogue bootpd or downstream 192.168.2.1)" \
+          "/sbin/ifconfig en9 2>/dev/null | grep -qE 'inet (192\.168\.2\.1|192\.168\.15\.)' && ! /usr/bin/pgrep -x bootpd >/dev/null 2>&1"
       else
         assert_ok "Unplugged en9 USB LAN dongle cleanly detached & default route on Home Wi-Fi ($wdev)" \
           "! iface_exists en9 && [[ \"\$(default_route_device)\" == \"\$wdev\" ]]"
