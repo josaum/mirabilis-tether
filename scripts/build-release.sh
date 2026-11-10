@@ -16,7 +16,7 @@ mkdir -p "${DIST_DIR}" "${PKG_ROOT}/usr/local/share/tether-optimize" "${PKG_SCRI
 echo "=== Building Tether-Optimize v${VERSION} Release Artifacts ==="
 
 # 1. Compile universal/native release binaries into staging tree
-mkdir -p "${PKG_ROOT}/usr/local/share/tether-optimize/"{bin,src,proofs,wireshark,launchd,scripts,web}
+mkdir -p "${PKG_ROOT}/usr/local/share/tether-optimize/"{bin,src,proofs,wireshark,launchd,scripts,web,paper}
 cp -R "${REPO_ROOT}/bin/"* "${PKG_ROOT}/usr/local/share/tether-optimize/bin/"
 cp -R "${REPO_ROOT}/src/"* "${PKG_ROOT}/usr/local/share/tether-optimize/src/"
 cp -R "${REPO_ROOT}/proofs/"* "${PKG_ROOT}/usr/local/share/tether-optimize/proofs/"
@@ -24,6 +24,7 @@ cp -R "${REPO_ROOT}/wireshark/"* "${PKG_ROOT}/usr/local/share/tether-optimize/wi
 cp -R "${REPO_ROOT}/launchd/"* "${PKG_ROOT}/usr/local/share/tether-optimize/launchd/"
 cp -R "${REPO_ROOT}/scripts/"* "${PKG_ROOT}/usr/local/share/tether-optimize/scripts/"
 cp -R "${REPO_ROOT}/web/"* "${PKG_ROOT}/usr/local/share/tether-optimize/web/"
+[[ -d "${REPO_ROOT}/paper" ]] && cp -R "${REPO_ROOT}/paper/"* "${PKG_ROOT}/usr/local/share/tether-optimize/paper/"
 [[ -f "${REPO_ROOT}/README.md" ]] && cp "${REPO_ROOT}/README.md" "${PKG_ROOT}/usr/local/share/tether-optimize/README.md"
 [[ -f "${REPO_ROOT}/Makefile" ]] && cp "${REPO_ROOT}/Makefile" "${PKG_ROOT}/usr/local/share/tether-optimize/Makefile"
 
