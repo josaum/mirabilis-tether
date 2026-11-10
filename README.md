@@ -1,6 +1,11 @@
-# Tether-Optimize v1.0.0 — Formally Verified macOS Personal Hotspot & WAN Optimizer
+# Mirabilis-Tether (`tether-optimize` v1.0.0)
+### *Mirabilis Abbreviatio* — Formally Verified macOS Personal Hotspot & WAN Optimizer
 
-**Tether-Optimize** is an event-driven macOS kernel optimization product and native Menu Bar suite that eliminates cellular baseband bufferbloat, Wi-Fi `awdl0` channel-hopping stutters, GTP-U/CLAT46 packet fragmentation, and background sync saturation when tethered to an iPhone, iPad, or Android Personal Hotspot (over Wi-Fi `en0` or USB `en7`/`en17`), while automatically restoring unshaped PPPoE-safe Gigabit Home Wi-Fi/LAN settings on disconnect.
+[![Lean 4 Kernel Verified](https://img.shields.io/badge/Lean_4-110_Theorems_(0_Axioms)-3fb950)](proofs/TetherOptimizeSpec.lean)
+[![Live Assertions](https://img.shields.io/badge/Live_Assertions-72%2F72_Passing-58a6ff)](bin/tether-optimize)
+[![macOS Platform](https://img.shields.io/badge/macOS-Apple_Silicon_%26_XNU-bc8cff)](https://github.com/josaum/mirabilis-tether)
+
+**Mirabilis-Tether** (`tether-optimize`) is an event-driven macOS kernel optimization product and native Menu Bar suite that eliminates cellular baseband bufferbloat, Wi-Fi `awdl0` channel-hopping stutters, GTP-U/CLAT46 packet fragmentation, and background sync saturation when tethered to an iPhone, iPad, or Android Personal Hotspot (over Wi-Fi `en0` or USB `en7`/`en17`), while automatically restoring unshaped PPPoE-safe Gigabit Home Wi-Fi/LAN settings on disconnect.
 
 Every control law, state transition, packet-size bound, and statistical estimator is machine-verified in **110 zero-axiom constructive Lean 4 theorems** ([`proofs/TetherOptimizeSpec.lean`](proofs/TetherOptimizeSpec.lean)) and continuously validated by **72 live system & unit assertions** (`tether-optimize test`).
 
@@ -57,6 +62,7 @@ tether-optimize/
 ### Install or Upgrade
 
 ```bash
+git clone https://github.com/josaum/mirabilis-tether.git ~/tether-optimize
 cd ~/tether-optimize
 ./scripts/install.sh
 ```
