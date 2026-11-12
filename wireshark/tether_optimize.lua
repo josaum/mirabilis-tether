@@ -185,7 +185,7 @@ local FAST_LANE_PORTS = {
 
 local LOCAL_GUARD_PORTS = {
     [3000]  = true, -- Next.js dev server
-    [7100]  = true, -- central-tether API
+    [7100]  = true, -- local API
     [8787]  = true, -- Tailscale webhook listener
     [11434] = true  -- Ollama API
 }
@@ -200,8 +200,8 @@ local SENSITIVE_SERVICE_PORTS = {
     [3000]  = "Next.js (:3000)",
     [3283]  = "Apple Remote Desktop (:3283)",
     [5900]  = "VNC/ScreenSharing (:5900)",
-    [7100]  = "Central-Tether API (:7100)",
-    [8787]  = "Tailscale Webhook (:8787)",
+    [7100]  = "Local API (:7100)",
+    [8787]  = "Webhook (:8787)",
     [11434] = "Ollama API (:11434)",
     [59124] = "Tailscale PeerAPI v6 (:59124)",
     [62411] = "Tailscale PeerAPI v4 (:62411)"

@@ -30,6 +30,13 @@ PERSONAL_PATTERNS = [
     r"(?i)lili-ursa",
     r"(?i)imac-de-lilian",
     r"(?i)sounio-language-macbook",
+    r"(?i)mycelia-waha",
+    r"(?i)waha-iap",
+    r"(?i)jquant",
+    r"(?i)litellm",
+    r"(?i)leio-embed",
+    r"(?i)central-tether",
+    r"(?i)ts-webhook",
 ]
 
 SHIPPED_FILES = [

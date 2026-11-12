@@ -6,7 +6,7 @@
     • ZeroTier Virtual Ethernet (feth110, site-local subnet, MTU 2800 → MSS 1220/1332 clamp)
     • SOCKS5 & HTTP/HTTPS Proxies (:1055 Tailscale SOCKS5, :1081 SSH SOCKS5, :7890 dead-proxy guard)
     • SSH / Cloudflare Access / GCP IAP Tunnels (:13000 WAHA IAP, :18080-18082 brother-gpu,
-      and :14000 leio-embed port-collision exclusion)
+      and :14000 local embedding-port collision exclusion)
     • LAN Gateway Sharing (en9 192.168.2.0/24 Mac Studio & RPi5 bridge100 exclusion + IPv4 forwarding)
     • PF Grammar Section Ordering & Anchor Reload Preservation (`sounio-tether-share` ↔ `tether-optimize`)
     • Mac Studio Cellular Fallback (`com.getjai.macstudio-cellular` on `en7`/`en17` for `192.168.1.160`)
@@ -327,8 +327,8 @@ inductive LocalServicePort where
   | socks5_tailscale_1055    -- com.josaum.tailscale-dionisio userspace SOCKS5 (127.0.0.1:1055)
   | socks5_ssh_fallback_1081 -- ~/.ssh/config fallback SOCKS5 proxy (127.0.0.1:1081)
   | system_proxy_clash_7890  -- macOS networksetup HTTP/HTTPS/SOCKS proxy (127.0.0.1:7890)
-  | gcp_iap_waha_13000       -- ai.jquant.waha-iap (127.0.0.1:13000 -> mycelia-waha:3000)
-  | leio_embed_bge_14000     -- Reserved for local leio-embed (bge-m3); NEVER tunnel-bound!
+  | iap_tunnel_13000       -- local IAP tunnel (127.0.0.1:13000)
+  | local_embed_14000     -- Reserved for a local embedding service; NEVER tunnel-bound!
   | cf_ssh_brother_18080     -- cloudflared access ssh brother-gpu (:18080..18082)
   deriving DecidableEq, Repr
 
@@ -337,8 +337,8 @@ def isAllowedTunnelForwardPort (p : LocalServicePort) : Bool :=
   | .socks5_tailscale_1055    => true
   | .socks5_ssh_fallback_1081 => true
   | .system_proxy_clash_7890  => false
-  | .gcp_iap_waha_13000       => true
-  | .leio_embed_bge_14000     => false -- Strictly reserved for local bge-m3 embedding server
+  | .iap_tunnel_13000       => true
+  | .local_embed_14000     => false -- Strictly reserved for local bge-m3 embedding server
   | .cf_ssh_brother_18080     => true
 
 def isReservedLocalModelPort (p : LocalServicePort) : Bool :=
@@ -346,13 +346,13 @@ def isReservedLocalModelPort (p : LocalServicePort) : Bool :=
   | .socks5_tailscale_1055    => false
   | .socks5_ssh_fallback_1081 => false
   | .system_proxy_clash_7890  => false
-  | .gcp_iap_waha_13000       => false
-  | .leio_embed_bge_14000     => true
+  | .iap_tunnel_13000       => false
+  | .local_embed_14000     => true
   | .cf_ssh_brother_18080     => false
 
-/-- Theorem 16 (Port 14000 Isolation): Reserved local embedding port `:14000` (`leio-embed`)
+/-- Theorem 16 (Port 14000 Isolation): Reserved local embedding port `:14000` (a local embedding service)
     is never permitted as an SSH/IAP tunnel forward port (preventing the retired
-    `litellm-tunnel` collision). -/
+    an LLM-gateway tunnel collision). -/
 theorem port_14000_never_bound_by_tunnel (p : LocalServicePort) :
     isReservedLocalModelPort p = true → isAllowedTunnelForwardPort p = false := by
   cases p <;> intro h <;> first | rfl | exact Bool.noConfusion h
@@ -464,7 +464,7 @@ structure SystemState where
   appleNativeDaemonsBg      : Bool  -- bird, cloudd, nsurlsessiond (must ALWAYS stay true)
   lanIpForwarding           : Bool  -- net.inet.ip.forwarding=1 for en9 192.168.2.0/24
   en9InBridge100            : Bool  -- Must ALWAYS remain false so bootpd serves DHCP on en9
-  port14000TunnelBound      : Bool  -- Must ALWAYS remain false (reserved for leio-embed)
+  port14000TunnelBound      : Bool  -- Must ALWAYS remain false (reserved for a local embedding service)
   proxyReachable            : Bool  -- System proxy sanitized against dead :7890 blackholes
   deriving DecidableEq, Repr
 
@@ -674,7 +674,7 @@ inductive GuardedListenPort where
   | ollama_11434     -- Ollama API (`*:11434` wildcard listener guarded by PF)
   | nextjs_3000      -- Next.js dev server (`*:3000` wildcard listener guarded by PF)
   | tailscale_1055   -- Tailscale SOCKS5 (`127.0.0.1:1055`)
-  | waha_iap_13000   -- GCP IAP tunnel (`127.0.0.1:13000`)
+  | iap_13000   -- IAP tunnel (`127.0.0.1:13000`)
   | webhook_18080    -- Webhook / Cloudflared tunnel (`127.0.0.1:18080`)
   | leio_embed_14000 -- Reserved local embedding server (`127.0.0.1:14000`)
   deriving DecidableEq, Repr

@@ -26,7 +26,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 WIFI_OFF=0
 SHAPE_ENABLED=1
 DOWN_MBPS=${TETHER_DOWN_MBPS:-25}
@@ -107,7 +107,7 @@ LEAN_BIN="${TETHER_LEAN_BIN:-${TETHER_USER_HOME}/.elan/toolchains/leanprover--le
 MENUBAR_APP="${TETHER_MENUBAR_APP:-${TETHER_USER_HOME}/Applications/TetherMenubar.app}"
 MENUBAR_PLIST="${TETHER_MENUBAR_PLIST:-${TETHER_USER_HOME}/Library/LaunchAgents/com.josaum.tether-menubar.plist}"
 WEB_WORKBENCH_FILE="${TETHER_WEB_WORKBENCH:-${TETHER_USER_HOME}/tether-optimize/web/index.html}"
-DNS_SERVERS=(1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4)
+DNS_SERVERS=(1.1.2.1 1.0.0.1 8.8.8.8 8.8.4.4)
 
 PIPE_DOWN_FAST=10
 PIPE_UP_FAST=11
@@ -1153,7 +1153,7 @@ emit_common_pf_tail() {
     echo "scrub on ${ov} inet all max-mss ${ov_mss}"
     echo "scrub on ${ov} inet6 all max-mss ${ov_mss}"
   done < <(list_overlay_ifaces)
-  echo "# Persistent local-service firewall guard (blocks non-loopback access to Next.js :3000, central-tether :7100, ts-webhook :8787 & Ollama :11434)"
+  echo "# Persistent local-service firewall guard (blocks non-loopback access to Next.js :3000, a local API :7100, a webhook :8787 & Ollama :11434)"
   echo "block drop in quick on ! lo0 proto tcp from any to any port { 3000, 7100, 8787, 11434 }"
   echo "# Peer watchlist (site-local, from ${WATCHLIST_FILE})"
   emit_watchlist_rules
@@ -1548,7 +1548,7 @@ restore_core() {
   # Standard Home Wi-Fi & Wired LAN (en9) optimization:
   #   • Primary service order: active home uplink first (or Wi-Fi) — idempotent, skips SCPreferences write if already #1
   #   • MTU 1492 on en0 and active home LAN uplink — idempotent, skips SIOCSIFMTU if already 1492 so en9 USB PHY never resets!
-  #   • Fast public DNS (1.1.1.1 / 1.0.0.1 / 8.8.8.8 / 8.8.4.4) + the discovered default gateway as fallback
+  #   • Fast public DNS (1.1.2.1 / 1.0.0.1 / 8.8.8.8 / 8.8.4.4) + the discovered default gateway as fallback
   set_airport_power_if_needed "$wdev" on || true
   if order_services_if_needed "$hsvc"; then
     sc_changed=1
@@ -1701,8 +1701,8 @@ status() {
       rtt=$(ping -c 2 -i 0.1 -t 1 172.20.10.1 2>/dev/null | awk -F'/' '/round-trip/{print $5 " ms"}' || true)
       [[ -n "$rtt" ]] && echo "gateway 172.20.10.1: $rtt avg RTT"
     else
-      rtt=$(ping -c 2 -i 0.1 -t 1 1.1.1.1 2>/dev/null | awk -F'/' '/round-trip/{print $5 " ms"}' || true)
-      [[ -n "$rtt" ]] && echo "cellular RTT (1.1.1.1): $rtt avg RTT"
+      rtt=$(ping -c 2 -i 0.1 -t 1 1.1.2.1 2>/dev/null | awk -F'/' '/round-trip/{print $5 " ms"}' || true)
+      [[ -n "$rtt" ]] && echo "cellular RTT (1.1.2.1): $rtt avg RTT"
     fi
   else
     local hip h_ifcfg
@@ -1849,10 +1849,10 @@ status() {
     fi
   }
   print_port_row "Tailscale SOCKS5" "1055"  "LISTENING on 127.0.0.1:1055 (userspace tailscaled UDP :41642 + fast pipe #10/#11)" "down"
-  print_port_row "GCP IAP Tunnel"   "13000" "LISTENING on 127.0.0.1:13000 -> mycelia-waha:3000 (ai.jquant.waha-iap)" "inactive"
-  print_port_row "Brother/Webhook"  "18080" "LISTENING on 127.0.0.1:18080 (Cloudflared SSH / WAHA webhook)" "inactive (ports 18080-18082 free)"
+  print_port_row "IAP Tunnel"       "13000" "LISTENING on 127.0.0.1:13000 to a local service" "inactive"
+  print_port_row "Webhook Tunnel"   "18080" "LISTENING on 127.0.0.1:18080 (Cloudflared SSH / local webhook)" "inactive (ports 18080-18082 free)"
   print_port_row "SSH SOCKS5"       "1081"  "LISTENING on 127.0.0.1:1081 (SSH DynamicForward)" "on-demand (~/.ssh/config DynamicForward 1081)"
-  print_port_row "Port 14000 Guard" "14000" "LISTENING on 127.0.0.1:14000 (reserved for local leio-embed; no tunnel conflict)" "reserved for local leio-embed (127.0.0.1:14000; retired litellm-tunnel conflict-free)"
+  print_port_row "Reserved Port 14000" "14000" "LISTENING on 127.0.0.1:14000 (reserved for a local service; no tunnel conflict)" "reserved for a local service (127.0.0.1:14000)"
   print_port_row "System Proxy 7890" "7890" "LISTENING on 127.0.0.1:7890" "no listener on :7890 — dead system proxies auto-disabled (no blackhole)"
   en9_ip=$(iface_ipv4 en9 || true)
   if [[ -n "$en9_ip" ]]; then
@@ -1860,7 +1860,7 @@ status() {
   else
     echo "  LAN Share (en9)  : inactive (share network served on demand)"
   fi
-  echo "  Firewall Guard   : block drop in quick on ! lo0 proto tcp to ports { 3000 (Next.js), 7100 (central-tether), 8787 (ts-webhook), 11434 (Ollama) }"
+  echo "  Firewall Guard   : block drop in quick on ! lo0 proto tcp to ports { 3000 (Next.js), 7100 (local API), 8787 (webhook), 11434 (Ollama) }"
   echo "  Daemon Binary    : $(stat -f '%Su:%Sg (mode %Lp)' "$SCRIPT_PATH" 2>/dev/null || echo 'root:wheel')"
 
   echo
@@ -2563,9 +2563,9 @@ pcap_audit() {
   # so both IPv4 & IPv6 TCP SYN MSS clamps, Window Scale, and iRTT are verified in parallel
   (
     sleep 0.2
-    /sbin/ping -c 2 -W 400 1.1.1.1 >/dev/null 2>&1 &
-    /usr/bin/dig +tries=1 +time=1 @1.1.1.1 one.one.one.one A >/dev/null 2>&1 &
-    /usr/bin/curl -4 -sS --max-time 1.5 -I https://1.1.1.1 >/dev/null 2>&1 &
+    /sbin/ping -c 2 -W 400 1.1.2.1 >/dev/null 2>&1 &
+    /usr/bin/dig +tries=1 +time=1 @1.1.2.1 one.one.one.one A >/dev/null 2>&1 &
+    /usr/bin/curl -4 -sS --max-time 1.5 -I https://1.1.2.1 >/dev/null 2>&1 &
     if /sbin/ifconfig "$dev" 2>/dev/null | grep -q 'inet6 2'; then
       /usr/bin/curl -6 -k -sS --max-time 1.5 -I https://[2606:4700:4700::1111] >/dev/null 2>&1 &
     fi
@@ -2903,8 +2903,10 @@ EOF
     "grep -q '^nat on en0 ' /etc/pf.conf && grep -q '^nat on en7 ' /etc/pf.conf && grep -q '^nat on en17 ' /etc/pf.conf"
   assert_ok "Generated PF anchor file ($PF_CONF_FILE) passes pfctl -vnf syntax check" \
     "[[ -f \"\$PF_CONF_FILE\" ]] && /sbin/pfctl -vnf \"\$PF_CONF_FILE\" >/dev/null 2>&1"
-  assert_ok "sounio-tether-share preserves com.apple/tether_optimize anchor on PF reload" \
-    "grep -q 'com.apple/tether_optimize' /usr/local/bin/sounio-tether-share"
+  if [[ -x /usr/local/bin/sounio-tether-share ]]; then
+    assert_ok "site-local share helper preserves the com.apple/tether_optimize anchor on PF reload" \
+      "grep -q 'com.apple/tether_optimize' /usr/local/bin/sounio-tether-share"
+  fi
 
   # Group D: LaunchDaemon Health & Binary Ownership Security
   assert_ok "LaunchDaemon com.josaum.tether-optimize is loaded and running" "daemon_loaded"
