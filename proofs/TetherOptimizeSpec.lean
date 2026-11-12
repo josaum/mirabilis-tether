@@ -3,7 +3,7 @@
   of the Full macOS Network Configuration:
     • Smartphone & iPad Personal Hotspots (Wi-Fi en0, iPhone USB en7, iPad USB en17)
     • Dual-Instance Tailscale (macsys utun* :41641 + userspace tailscale-dionisio :41642)
-    • ZeroTier Virtual Ethernet (feth110, 192.168.3.0/24, MTU 2800 → MSS 1220/1332 clamp)
+    • ZeroTier Virtual Ethernet (feth110, site-local subnet, MTU 2800 → MSS 1220/1332 clamp)
     • SOCKS5 & HTTP/HTTPS Proxies (:1055 Tailscale SOCKS5, :1081 SSH SOCKS5, :7890 dead-proxy guard)
     • SSH / Cloudflare Access / GCP IAP Tunnels (:13000 WAHA IAP, :18080-18082 brother-gpu,
       and :14000 leio-embed port-collision exclusion)
@@ -15,8 +15,8 @@
   Strict Verification Guarantees:
     • Zero external imports (pure Lean 4 Init prelude only — no Mathlib, no Lake packages)
     • Zero incomplete proofs or holes
-    • Zero kernel axioms on all 74 theorems (`does not depend on any axioms` —
-      not even `Classical.choice`, `propext`, or `Quot.sound`)
+    • Zero kernel axioms on all 110 numbered theorems (153 declarations incl. helper lemmas —
+      `does not depend on any axioms` — not even `Classical.choice`, `propext`, or `Quot.sound`)
 -/
 
 namespace TetherOptimizeSpec
@@ -31,7 +31,7 @@ inductive PortId where
   | en9_lan_segment   -- 192.168.2.0/24 Mac Studio / RPi5 LAN segment
   | usb_dock_eth      -- AX88179 / Dell D6000 USB Ethernet docks
   | utun_tailscale    -- Tailscale WireGuard tunnel interfaces (utun0..utun7)
-  | feth110_zerotier  -- ZeroTier virtual Ethernet (192.168.3.245, MTU 2800)
+  | feth110_zerotier  -- ZeroTier virtual Ethernet (site-local address, MTU 2800)
   deriving DecidableEq, Repr
 
 inductive Transport where
@@ -924,7 +924,7 @@ theorem secondary_wifi_control_flows_get_fast_pipe (f : FlowKind) :
 /-- Theorem 40 (Home Wi-Fi PPPoE 1492 WAN Zero-Fragmentation): Clamping Home Wi-Fi (`en0`)
     to MTU 1492 and TCP MSS 1452 (IPv4) / 1432 (IPv6) guarantees that full-sized TCP segments
     fit strictly inside the 1492 B PPPoE WAN MTU, whereas default Ethernet MSS 1460 (1500 B)
-    exceeds it and triggers upstream DF fragmentation drops (`192.168.15.1`). -/
+    exceeds it and triggers upstream DF fragmentation drops at the LAN gateway. -/
 theorem home_wifi_pppoe_1492_never_fragments :
     ipv4PacketBytes homeWifiIpv4Mss ≤ pppoeWanMtu ∧
     ipv6PacketBytes homeWifiIpv6Mss ≤ pppoeWanMtu ∧
@@ -1253,7 +1253,7 @@ theorem all_16384_pairwise_handovers_reversible (obs1 obs2 : LinkObservation) :
 /-! ## 17. Wired Home LAN (`en9`) Rogue DHCP Guard & Dual-Mode (`en9`) Disjointness -/
 
 /-- Models the operating role of `en9` (`USB 10/100/1000 LAN`):
-    • `upstreamHomeLan` : `en9` is plugged into the home router/switch (`192.168.15.0/24` or default route)
+    • `upstreamHomeLan` : `en9` is plugged into the home router/switch (site-local subnet or default route)
     • `downstreamShare` : `en9` is an isolated downstream segment (`192.168.2.0/24`) for Mac Studio / RPi5
     • `disconnected`    : `en9` has no carrier / no IP -/
 inductive En9Role where
@@ -1301,7 +1301,7 @@ def applyEn9Guard (hasUpstreamIp isDefaultRoute hasLink : Bool) : En9GuardState 
       en9Mtu            := 1500 }
 
 /-- Theorem 61 (Upstream Home LAN on `en9` Suppresses Rogue DHCP & `192.168.2.1` Alias):
-    Whenever `en9` has an upstream Home LAN IP (e.g. `192.168.15.5`) or is the default route,
+    Whenever `en9` has an upstream Home LAN IP (a site-local address) or is the default route,
     `applyEn9Guard` guarantees `bootpdRunning = false`, `alias192_168_2_1 = false`,
     `pfPppoeScrubOnEn9 = true`, and `en9Mtu = 1492`, preventing rogue DHCP leases on the home LAN. -/
 theorem en9_upstream_lan_never_runs_rogue_dhcp (hasUpstreamIp isDefaultRoute hasLink : Bool)

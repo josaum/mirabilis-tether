@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Shell syntax
+        run: |
+          bash -n bin/tether-optimize
+          bash -n scripts/install.sh
+          bash -n scripts/build-release.sh
+
+      - name: Python and JS syntax
+        run: |
+          python3 -m py_compile web/serve.py
+          node --check web/static/app.js
+
+      - name: Unit tests (parsers, snapshot, watchlist, no-personal-data guard)
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Workbench endpoints
+        run: |
+          python3 web/serve.py --port 7189 --root web >/tmp/workbench.log 2>&1 &
+          for i in $(seq 1 40); do
+            if curl -fsS "http://127.0.0.1:7189/api/health" >/dev/null 2>&1; then break; fi
+            sleep 0.25
+          done
+          for path in / /static/app.css /static/app.js /api/snapshot /api/theorems /api/history /api/rules; do
+            code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://127.0.0.1:7189${path}")
+            echo "${path} ${code}"
+            test "${code}" = "200"
+          done
+
+      - name: Lean 4 proofs (skipped when the toolchain is absent)
+        run: |
+          if command -v lean >/dev/null 2>&1; then
+            lean --run proofs/TetherOptimizeSpec.lean
+          else
+            echo "lean not installed on this runner — skipping formal check"
+          fi

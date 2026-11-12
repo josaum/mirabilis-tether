@@ -26,7 +26,7 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 WIFI_OFF=0
 SHAPE_ENABLED=1
 DOWN_MBPS=${TETHER_DOWN_MBPS:-25}
@@ -43,6 +43,9 @@ MODE=apply
 POLL_SECS=2
 PCAP_SECS=4
 LAST_PCAP_FILE="/tmp/tether-optimize-audit.pcapng"
+WEB_ARG=""
+WEB_WORKBENCH_PORT=""
+EMIT_MSS=""
 
 resolve_user_home() {
   if [[ -n "${TETHER_HOME:-}" && -d "${TETHER_HOME}" ]]; then
@@ -74,6 +77,11 @@ WIRESHARK_SKILL_DIR="${TETHER_WIRESHARK_SCRIPTS:-${TETHER_USER_HOME}/.gemini/con
 LABEL="com.josaum.tether-optimize"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
 STATE_DIR="/usr/local/var/tether-optimize"
+USER_STATE_DIR="${TETHER_USER_STATE_DIR:-${TETHER_USER_HOME}/.local/state/tether-optimize}"
+LAST_AUDIT_FILE="${USER_STATE_DIR}/last-audit.json"
+VERIFY_STATE_FILE="${USER_STATE_DIR}/verify.state"
+CONFIG_DIR="${TETHER_CONFIG_DIR:-${TETHER_USER_HOME}/.config/tether-optimize}"
+WATCHLIST_FILE="${TETHER_WATCHLIST:-${CONFIG_DIR}/watchlist.conf}"
 UI_SNAPSHOT_FILE="${STATE_DIR}/ui.snapshot"
 STATE_FILE="$UI_SNAPSHOT_FILE"
 OVERLAY_STATE_FILE="$UI_SNAPSHOT_FILE"
@@ -94,6 +102,7 @@ LOG_FILE="${STATE_DIR}/tether-optimize.log"
 USER_PREFS_FILE="${TETHER_PREFS_FILE:-${TETHER_USER_HOME}/.tether-optimize.prefs}"
 DEFAULT_USER_PREFS_FILE="$USER_PREFS_FILE"
 LEAN_SPEC_FILE="${TETHER_LEAN_SPEC:-${SCRIPT_DIR}/TetherOptimizeSpec.lean}"
+[[ -f "$LEAN_SPEC_FILE" ]] || LEAN_SPEC_FILE="${SCRIPT_DIR}/../proofs/TetherOptimizeSpec.lean"
 LEAN_BIN="${TETHER_LEAN_BIN:-${TETHER_USER_HOME}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean}"
 MENUBAR_APP="${TETHER_MENUBAR_APP:-${TETHER_USER_HOME}/Applications/TetherMenubar.app}"
 MENUBAR_PLIST="${TETHER_MENUBAR_PLIST:-${TETHER_USER_HOME}/Library/LaunchAgents/com.josaum.tether-menubar.plist}"
@@ -124,7 +133,9 @@ tether-optimize — Smartphone & iPad Personal Hotspot Optimizer (Wi-Fi en0 + US
     tether-optimize owd-probe       run live 3-reflector RFC 792 Type 13/14 One-Way Delay quorum probe
     tether-optimize tail-mle [...]  Taleb Pareto(L, α) MLE ~ InvGamma(n, nα) & Pontryagin u*(λ) control
     tether-optimize wireshark-gui   open last audit capture in Wireshark.app (Tether-Optimize profile)
-    tether-optimize web             open interactive Product Workbench & Proof Explorer in browser
+    tether-optimize web             serve the live workbench on 127.0.0.1:7180 and open it (--static: open file copy, --port <n>)
+    tether-optimize web-stop        stop the local workbench server
+    tether-optimize watchlist       show the peer watchlist file and the rules it produces
     tether-optimize doctor          run comprehensive product environment & capability diagnostic
     tether-optimize version         show product version, theorem count, and component build info
     tether-optimize verify          run 110-theorem Lean 4 formal verification + 72 live assertions
@@ -272,8 +283,25 @@ load_user_prefs
 TAIL_MLE_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    status|pf-status|restore|apply|watch|install-auto|uninstall-auto|auto-status|test-popup|unshape|shape|verify|verify-lean|test|self-test|menubar|menubar-start|menubar-stop|wireshark-gui|owd-probe|doctor|version|web|workbench|__root_apply|__root_restore)
+    status|pf-status|restore|apply|watch|install-auto|uninstall-auto|auto-status|test-popup|unshape|shape|verify|verify-lean|test|self-test|menubar|menubar-start|menubar-stop|wireshark-gui|owd-probe|doctor|version|web-stop|watchlist|__root_apply|__root_restore)
       MODE=$1; shift ;;
+    web|workbench)
+      MODE=web
+      shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --static) WEB_ARG="--static"; shift ;;
+          --port) WEB_WORKBENCH_PORT=${2:?Usage: tether-optimize web --port <n>}; shift 2 ;;
+          *) echo "Unknown web option: $1" >&2; exit 2 ;;
+        esac
+      done
+      ;;
+    __emit_rules)
+      MODE=__emit_rules; shift
+      EMIT_MSS="${1:-}"
+      [[ -n "$EMIT_MSS" ]] && shift
+      break
+      ;;
     -v|--version)
       MODE=version; shift ;;
     tail-mle)
@@ -444,7 +472,7 @@ is_usb_hotspot_device() {
 }
 
 # Echoes "<dev>|<service>" for the active non-hotspot Home Wi-Fi / Wired LAN interface.
-# Prefers an active Wired Gigabit LAN on en9 when en9 holds an upstream LAN IP (e.g. 192.168.15.x),
+# Prefers an active Wired Gigabit LAN on en9 when en9 holds a routable upstream LAN IP,
 # even if Wi-Fi was previously ordered ahead of USB 10/100/1000 LAN.
 # Strictly excludes iPhone/iPad USB hotspot devices (en7, en17) so a stale default route
 # during cable unplug never misclassifies a USB tether port as a Home LAN interface.
@@ -673,6 +701,28 @@ apply_tcp_profile() {
     net.inet.tcp.bg_target_qdelay=${bg_q} \
     net.inet.tcp.bg_tether_shift=${bg_shift} \
     net.inet.tcp.bg_allowed_increase=${bg_inc} >/dev/null 2>&1 || true
+
+  # Record what was applied so the workbench compares live values against this
+  # profile instead of a hardcoded expectation.
+  {
+    printf 'profile=%s\n' "$profile"
+    printf 'applied_ts=%s\n' "$(date +%s)"
+    printf 'net.inet.tcp.delayed_ack=3\n'
+    printf 'net.inet.tcp.sendspace=%s\n' "$snd"
+    printf 'net.inet.tcp.recvspace=%s\n' "$rcv"
+    printf 'net.inet.tcp.autosndbufmax=%s\n' "$max_snd"
+    printf 'net.inet.tcp.autorcvbufmax=%s\n' "$max_rcv"
+    printf 'net.inet.tcp.autosndbufinc=%s\n' "$inc"
+    printf 'net.inet.tcp.mssdflt=%s\n' "$mss"
+    printf 'net.inet.tcp.v6mssdflt=%s\n' "$v6mss"
+    printf 'net.inet.tcp.l4s=1\n'
+    printf 'net.inet.tcp.bg_target_qdelay=%s\n' "$bg_q"
+    printf 'net.inet.tcp.bg_tether_shift=%s\n' "$bg_shift"
+    printf 'net.inet.tcp.bg_allowed_increase=%s\n' "$bg_inc"
+    printf 'net.classq.fq_codel.enable_ecn=1\n'
+    printf 'net.classq.fq_codel.enable_l4s=1\n'
+    printf 'net.classq.fq_codel.enable_pacing=1\n'
+  } > "${STATE_DIR}/tcp-profile.env" 2>/dev/null || true
 }
 
 apply_hotspot_sysctls() { apply_tcp_profile hotspot; }
@@ -682,6 +732,21 @@ restore_sysctls()       { apply_tcp_profile home; }
 
 list_overlay_ifaces() {
   /sbin/ifconfig -l 2>/dev/null | tr ' ' '\n' | grep -E '^(utun[0-9]+|feth[0-9]+)$' | sort -V || true
+}
+
+list_security_overlay_ifaces() {
+  local ov info
+  while IFS= read -r ov; do
+    [[ -z "$ov" ]] && continue
+    if [[ "$ov" == feth* ]]; then
+      printf '%s\n' "$ov"
+    elif [[ "$ov" == utun* ]]; then
+      info=$(/sbin/ifconfig "$ov" 2>/dev/null || true)
+      if printf '%s\n' "$info" | grep -qE 'inet 100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|inet6 fd7a:115c:a1e0:'; then
+        printf '%s\n' "$ov"
+      fi
+    fi
+  done < <(list_overlay_ifaces)
 }
 
 overlay_ifaces_snapshot() {
@@ -1017,6 +1082,70 @@ dummynet out on ${d} all pipe ${PIPE_UP_BULK}
 EOF
 }
 
+# --- Peer watchlist (site-local PF guard rules) --------------------------------
+# Format per non-comment line: <addr-or-cidr> [in|out|both] [all|tcp|udp|icmp] [syn]
+watchlist_entries() {
+  [[ -r "$WATCHLIST_FILE" ]] || return 0
+  local addr dir proto extra
+  while read -r addr dir proto extra _; do
+    [[ -z "$addr" || "$addr" == \#* ]] && continue
+    printf '%s|%s|%s|%s\n' "$addr" "${dir:-both}" "${proto:-all}" "$extra"
+  done < "$WATCHLIST_FILE"
+}
+
+emit_watchlist_rules() {
+  local -a v4_both=() v6_both=() singles=() addr dir proto extra rule src dst joined
+  while IFS='|' read -r addr dir proto extra; do
+    [[ -z "$addr" ]] && continue
+    if [[ "$dir" == "both" && "$proto" == "all" ]]; then
+      if [[ "$addr" == *:* ]]; then v6_both+=("$addr"); else v4_both+=("$addr"); fi
+    else
+      singles+=("$addr|$dir|$proto|$extra")
+    fi
+  done < <(watchlist_entries)
+
+  if (( ${#v4_both[@]} )); then
+    joined=$(printf '%s, ' "${v4_both[@]}"); joined=${joined%, }
+    echo "block drop in quick inet from { ${joined} } to any"
+    echo "block drop out quick inet from any to { ${joined} }"
+  fi
+  if (( ${#v6_both[@]} )); then
+    joined=$(printf '%s, ' "${v6_both[@]}"); joined=${joined%, }
+    echo "block drop in quick inet6 from { ${joined} } to any"
+    echo "block drop out quick inet6 from any to { ${joined} }"
+  fi
+  for rule in "${singles[@]}"; do
+    IFS='|' read -r addr dir proto extra <<< "$rule"
+    if [[ "$dir" == "out" ]]; then src="any"; dst="$addr"; else src="$addr"; dst="any"; fi
+    case "$proto" in
+      tcp)
+        if [[ "$extra" == "syn" ]]; then
+          echo "block drop ${dir} quick inet proto tcp from ${src} to ${dst} flags S/SA"
+        else
+          echo "block drop ${dir} quick inet proto tcp from ${src} to ${dst}"
+        fi ;;
+      udp)  echo "block drop ${dir} quick inet proto udp from ${src} to ${dst}" ;;
+      icmp) echo "block drop ${dir} quick inet proto icmp from ${src} to ${dst} icmp-type echoreq" ;;
+      *)    echo "block drop ${dir} quick inet from ${src} to ${dst}" ;;
+    esac
+  done
+}
+
+watchlist_loaded() {
+  [[ -r "$SHAPER_STATE_FILE" ]] || return 1
+  local entry count=0
+  while IFS='|' read -r entry _ _ _; do
+    [[ -z "$entry" ]] && continue
+    count=$((count + 1))
+    grep -q -- "$entry" "$SHAPER_STATE_FILE" || return 1
+  done < <(watchlist_entries)
+  # An empty watchlist must not leave stale peer rules behind from a previous config.
+  if [[ $count -eq 0 ]]; then
+    grep -qE '^block drop (in|out) quick (inet|inet6) from (any to )?\{ ' "$SHAPER_STATE_FILE" && return 1
+  fi
+  return 0
+}
+
 emit_common_pf_tail() {
   local ov_mss=$1 ov
   while IFS= read -r ov; do
@@ -1024,8 +1153,19 @@ emit_common_pf_tail() {
     echo "scrub on ${ov} inet all max-mss ${ov_mss}"
     echo "scrub on ${ov} inet6 all max-mss ${ov_mss}"
   done < <(list_overlay_ifaces)
-  echo "# Persistent local-service firewall guard (blocks non-loopback access to Ollama :11434 & Next.js :3000)"
-  echo "block drop in quick on ! lo0 proto tcp from any to any port { 3000, 11434 }"
+  echo "# Persistent local-service firewall guard (blocks non-loopback access to Next.js :3000, central-tether :7100, ts-webhook :8787 & Ollama :11434)"
+  echo "block drop in quick on ! lo0 proto tcp from any to any port { 3000, 7100, 8787, 11434 }"
+  echo "# Peer watchlist (site-local, from ${WATCHLIST_FILE})"
+  emit_watchlist_rules
+  while IFS= read -r ov; do
+    [[ -z "$ov" ]] && continue
+    if [[ "$ov" == feth* ]]; then
+      echo "block drop in quick on ${ov} proto tcp from any to any flags S/SA"
+    else
+      echo "block drop in quick on ${ov} proto tcp from any to any port { 22, 88, 445, 3283, 5000, 5900, 7000, 7100, 8787, 49152:65535 } flags S/SA"
+    fi
+    echo "block drop in quick on ${ov} proto udp from any to any port { 137, 138, 161, 162, 445, 1900, 3283, 3702, 5353, 5355, 5900, 6667, 6681, 10001 }"
+  done < <(list_security_overlay_ifaces)
 }
 
 commit_pf_anchor_and_overlay_state() {
@@ -1077,7 +1217,7 @@ apply_shaper_and_pf() {
   ' "$PF_CONF_FILE" > "${PF_CONF_FILE}.ord" && mv -f "${PF_CONF_FILE}.ord" "$PF_CONF_FILE"
 
   /sbin/pfctl -E >/dev/null 2>&1 || true
-  /sbin/pfctl -a "$PF_ANCHOR" -f "$PF_CONF_FILE" >/dev/null 2>&1 || true
+  /sbin/pfctl -o none -a "$PF_ANCHOR" -f "$PF_CONF_FILE" >/dev/null 2>&1 || true
   {
     echo "[PF Scrub & Local-Service Firewall Rules in $PF_ANCHOR]"
     /sbin/pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null || true
@@ -1118,7 +1258,7 @@ restore_shaper_and_pf() {
     emit_common_pf_tail "$HOME_OVERLAY_MSS"
   } > "$PF_CONF_FILE"
   /sbin/pfctl -E >/dev/null 2>&1 || true
-  /sbin/pfctl -a "$PF_ANCHOR" -f "$PF_CONF_FILE" >/dev/null 2>&1 || true
+  /sbin/pfctl -o none -a "$PF_ANCHOR" -f "$PF_CONF_FILE" >/dev/null 2>&1 || true
   {
     echo "[PF Standard Home Wi-Fi / LAN Scrub & Local-Service Firewall Rules in $PF_ANCHOR (hotspot shaper inactive)]"
     /sbin/pfctl -a "$PF_ANCHOR" -s rules 2>/dev/null || true
@@ -1350,7 +1490,7 @@ apply_core() {
 }
 
 # Prevents en9 from running a rogue DHCP server (bootpd) or carrying a conflicting
-# 192.168.2.1 alias when en9 is plugged into an upstream Home/Office LAN (e.g. 192.168.15.0/24).
+# a conflicting LAN alias when en9 is plugged into a different upstream Home/Office LAN.
 sanitize_en9_upstream_lan_guard() {
   is_root || return 0
   local en9_upstream_ip def_dev
@@ -1408,7 +1548,7 @@ restore_core() {
   # Standard Home Wi-Fi & Wired LAN (en9) optimization:
   #   • Primary service order: active home uplink first (or Wi-Fi) — idempotent, skips SCPreferences write if already #1
   #   • MTU 1492 on en0 and active home LAN uplink — idempotent, skips SIOCSIFMTU if already 1492 so en9 USB PHY never resets!
-  #   • Fast public DNS (1.1.1.1 / 1.0.0.1 / 8.8.8.8 / 8.8.4.4) + local router fallback (192.168.15.1 / 192.168.1.1)
+  #   • Fast public DNS (1.1.1.1 / 1.0.0.1 / 8.8.8.8 / 8.8.4.4) + the discovered default gateway as fallback
   set_airport_power_if_needed "$wdev" on || true
   if order_services_if_needed "$hsvc"; then
     sc_changed=1
@@ -1425,7 +1565,9 @@ restore_core() {
   set_iface_mtu_if_needed "$wdev" "$HOME_WIFI_MTU" || true
   [[ "$hdev" != "$wdev" ]] && iface_exists "$hdev" && { set_iface_mtu_if_needed "$hdev" "$HOME_WIFI_MTU" || true; }
   dns=""
-  for d in "${DNS_SERVERS[@]}" 192.168.15.1 192.168.1.1; do dns+=" $d"; done
+  local dns_gw
+  dns_gw=$(/sbin/route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+  for d in "${DNS_SERVERS[@]}" ${dns_gw:+"$dns_gw"}; do dns+=" $d"; done
   if set_service_dns_if_needed "Wi-Fi" "$dns"; then
     sc_changed=1
   fi
@@ -1614,7 +1756,7 @@ status() {
     home_outer_cnt=$(grep -cE "max-mss (${HOME_WIFI_MSS}|${HOME_WIFI_V6MSS})" "$SHAPER_STATE_FILE" 2>/dev/null || true)
     home_ov_cnt=$(grep -c "max-mss ${HOME_OVERLAY_MSS}" "$SHAPER_STATE_FILE" 2>/dev/null || true)
     dummynet_cnt=$(grep -c "^dummynet " "$SHAPER_STATE_FILE" 2>/dev/null || true)
-    fw_cnt=$(grep -c "^block drop in quick on ! lo0" "$SHAPER_STATE_FILE" 2>/dev/null || true)
+    fw_cnt=$(grep -c "^block drop " "$SHAPER_STATE_FILE" 2>/dev/null || true)
     if [[ "$active_dev" != "none" ]]; then
       echo "  Outer Hotspot MSS : max-mss ${HOTSPOT_MSS} (IPv4 + IPv6, ${scrub_outer_cnt} rules on ${shaped_devs})"
       echo "  Inner Overlay MSS : max-mss ${OVERLAY_MSS} (IPv4 + IPv6, ${scrub_ov_cnt} rules across utun* / feth*)"
@@ -1624,7 +1766,7 @@ status() {
       echo "  Outer Home Uplink : max-mss ${HOME_WIFI_MSS} IPv4 / ${HOME_WIFI_V6MSS} IPv6 (${home_outer_cnt} rules on ${home_devs_pf} for PPPoE 1492 WAN)"
       echo "  Inner Overlay MSS : max-mss ${HOME_OVERLAY_MSS} (IPv4 + IPv6, ${home_ov_cnt} rules across utun* / feth*)"
     fi
-    echo "  Firewall Guard    : ${fw_cnt} active non-loopback block rules (ports 3000 Next.js, 11434 Ollama)"
+    echo "  Firewall Guard    : ${fw_cnt} active block rules (ports 3000/11434 + Tailscale/ZeroTier Watchlist & Overlay Guard)"
     if [[ $SHAPE_ENABLED -eq 1 && "$dummynet_cnt" -gt 0 ]]; then
       local st_eff_d=$DOWN_MBPS st_eff_u=$UP_MBPS st_base_rtt=0 st_cur_rtt=0 st_delta_rtt=0 st_reg="ceiling" st_fast_d st_fast_u
       local st_alpha="2.00" st_ign="0" st_sh="20.0" st_v99="100.0" st_treg="levy_fat" st_ld="20" st_lu="20" st_owd_d="0" st_owd_u="0" st_owd_m="owd"
@@ -1713,14 +1855,12 @@ status() {
   print_port_row "Port 14000 Guard" "14000" "LISTENING on 127.0.0.1:14000 (reserved for local leio-embed; no tunnel conflict)" "reserved for local leio-embed (127.0.0.1:14000; retired litellm-tunnel conflict-free)"
   print_port_row "System Proxy 7890" "7890" "LISTENING on 127.0.0.1:7890" "no listener on :7890 — dead system proxies auto-disabled (no blackhole)"
   en9_ip=$(iface_ipv4 en9 || true)
-  if [[ "$en9_ip" == 192.168.2.* ]]; then
-    echo "  LAN Share (en9)  : ${en9_ip} (downstream 192.168.2.0/24 segment active)"
-  elif [[ -n "$en9_ip" ]]; then
-    echo "  LAN Share (en9)  : disabled (en9 is active upstream Home LAN ${en9_ip}; rogue bootpd suppressed)"
+  if [[ -n "$en9_ip" ]]; then
+    echo "  LAN Share (en9)  : ${en9_ip} (upstream LAN; rogue bootpd suppressed)"
   else
-    echo "  LAN Share (en9)  : inactive (sounio-tether-share 192.168.2.0/24 on-demand)"
+    echo "  LAN Share (en9)  : inactive (share network served on demand)"
   fi
-  echo "  Firewall Guard   : block drop in quick on ! lo0 proto tcp to ports { 3000 (Next.js), 11434 (Ollama) }"
+  echo "  Firewall Guard   : block drop in quick on ! lo0 proto tcp to ports { 3000 (Next.js), 7100 (central-tether), 8787 (ts-webhook), 11434 (Ollama) }"
   echo "  Daemon Binary    : $(stat -f '%Su:%Sg (mode %Lp)' "$SCRIPT_PATH" 2>/dev/null || echo 'root:wheel')"
 
   echo
@@ -2337,8 +2477,19 @@ verify_lean() {
   fi
   out=$("$lean_cmd" --run "$LEAN_SPEC_FILE" 2>&1)
   printf '%s\n' "$out"
+  local ok=1 passed total
+  passed=$(printf '%s\n' "$out" | sed -nE 's/.*✓ ([0-9]+)\/([0-9]+) theorems kernel-verified.*/\1/p' | tail -1)
+  total=$(printf '%s\n' "$out" | sed -nE 's/.*✓ ([0-9]+)\/([0-9]+) theorems kernel-verified.*/\2/p' | tail -1)
+  printf '%s\n' "$out" | grep -q 'kernel-verified' || ok=0
   if printf '%s\n' "$out" | grep -q 'depends on axioms:'; then
-    echo "Error: one or more theorems depend on axioms" >&2
+    ok=0
+  fi
+  mkdir -p "$USER_STATE_DIR" 2>/dev/null || true
+  printf 'ok=%s\npassed=%s\ntotal=%s\nts=%s\nspec=%s\nlean=%s\n' \
+    "$ok" "${passed:-0}" "${total:-0}" "$(date +%s)" "$(basename "$LEAN_SPEC_FILE")" "$(basename "$lean_cmd")" \
+    > "$VERIFY_STATE_FILE" 2>/dev/null || true
+  if [[ $ok -ne 1 ]]; then
+    echo "Error: Lean 4 verification did not complete cleanly (see $VERIFY_STATE_FILE)" >&2
     exit 1
   fi
 }
@@ -2355,6 +2506,12 @@ pcap_audit() {
   dumpcap_bin=$(command -v dumpcap || echo "/opt/homebrew/bin/dumpcap")
   tshark_bin=$(command -v tshark || echo "/opt/homebrew/bin/tshark")
   capinfos_bin=$(command -v capinfos || echo "/opt/homebrew/bin/capinfos")
+
+  # Persist the audit summary for the workbench; skip it if the dir is not writable
+  local audit_json=""
+  if mkdir -p "$USER_STATE_DIR" 2>/dev/null && [[ -w "$USER_STATE_DIR" ]]; then
+    audit_json="$LAST_AUDIT_FILE"
+  fi
 
   if [[ ! -x "$dumpcap_bin" || ! -x "$tshark_bin" ]]; then
     echo "Error: Wireshark CLI tools (dumpcap / tshark) not found." >&2
@@ -2385,10 +2542,21 @@ pcap_audit() {
   fi
 
   rm -f "$LAST_PCAP_FILE"
-  echo "=== On-Demand Wireshark Wire Audit (${mode_label}, ${secs}s header-only capture) ==="
+  echo "=== On-Demand Wireshark Wire Audit (${mode_label}, ${secs}s header+overlay capture) ==="
 
-  # Launch dumpcap with 128-byte header-only snaplen (-s 128) so zero sensitive payload is written
-  "$dumpcap_bin" -q -i "$dev" -s 128 -a "duration:${secs}" -w "$LAST_PCAP_FILE" >/dev/null 2>&1 &
+  local -a cap_ifaces=("-i" "$dev")
+  local cap_desc="$dev"
+  if iface_exists utun14 && [[ "$dev" != "utun14" ]]; then
+    cap_ifaces+=("-i" "utun14")
+    cap_desc="${cap_desc}+utun14"
+  fi
+  if iface_exists feth110 && [[ "$dev" != "feth110" ]]; then
+    cap_ifaces+=("-i" "feth110")
+    cap_desc="${cap_desc}+feth110"
+  fi
+
+  # Launch dumpcap with 576-byte snaplen (-s 576) to capture TCP/IP/WireGuard/mDNS + >320B DHCP Option 50/12 headers
+  "$dumpcap_bin" -q "${cap_ifaces[@]}" -s 576 -a "duration:${secs}" -w "$LAST_PCAP_FILE" >/dev/null 2>&1 &
   local dpid=$!
 
   # Generate light concurrent synthetic probes (ICMP, unicast DNS :53, IPv4 HTTPS & IPv6 HTTPS)
@@ -2422,23 +2590,29 @@ pcap_audit() {
     -e tcp.stream -e tcp.analysis.initial_rtt -e tcp.analysis.retransmission \
     -e tcp.analysis.fast_retransmission -e tcp.analysis.duplicate_ack \
     -e tcp.analysis.zero_window -e tcp.flags.reset -e tether.fast_lane \
-    -e tether.ecn -e dhcp -e udp.srcport -e udp.dstport -e dns.time -e tether.syn_ecn 2>/dev/null \
-    | awk -F'|' -v dev="$dev" -v pfile="$LAST_PCAP_FILE" -v exp_mtu="$exp_mtu" \
+    -e tether.ecn -e dhcp -e udp.srcport -e udp.dstport -e dns.time -e tether.syn_ecn \
+    -e tether.security.suspect_peer -e tether.security.anomaly -e frame.interface_name 2>/dev/null \
+    | awk -F'|' -v dev="$dev" -v cap_desc="$cap_desc" -v pfile="$LAST_PCAP_FILE" -v exp_mtu="$exp_mtu" \
+          -v jfile="$audit_json" -v now_ts="$(date +%s)" \
           -v exp_mss="$exp_mss" -v exp_v6mss="$exp_v6mss" -v shaped="$shape_active" '
     {
       total++
+      ifname = $25
+      is_uplink = (ifname == "" || ifname == dev)
       l3 = $1 + 0
       if (l3 == 0) { if ($2 != "") l3 = $2 + 0; else if ($3 != "") l3 = ($3 + 0) + 40 }
-      if (l3 > max_l3) max_l3 = l3
-      if ($2 != "" && ($2 + 0) > max_v4) max_v4 = $2 + 0
-      if ($3 != "" && (($3 + 0) + 40) > max_v6) max_v6 = ($3 + 0) + 40
+      if (is_uplink) {
+        if (l3 > max_l3) max_l3 = l3
+        if ($2 != "" && ($2 + 0) > max_v4) max_v4 = $2 + 0
+        if ($3 != "" && (($3 + 0) + 40) > max_v6) max_v6 = ($3 + 0) + 40
+      }
       if ($4 == "True" || $4 == "1") frag++
 
       if (($5 == "True" || $5 == "1") && $7 != "") {
         mss = $7 + 0
         if ($6 == "False" || $6 == "0") {
-          if ($2 != "" && !seen_v4[mss]++) out_v4 = (out_v4 == "" ? mss : out_v4 " " mss)
-          if ($3 != "" && !seen_v6[mss]++) out_v6 = (out_v6 == "" ? mss : out_v6 " " mss)
+          if (is_uplink && $2 != "" && !seen_v4[mss]++) out_v4 = (out_v4 == "" ? mss : out_v4 " " mss)
+          if (is_uplink && $3 != "" && !seen_v6[mss]++) out_v6 = (out_v6 == "" ? mss : out_v6 " " mss)
         } else if (!seen_in[mss]++) {
           in_mss = (in_mss == "" ? mss : in_mss " " mss)
         }
@@ -2459,6 +2633,8 @@ pcap_audit() {
       if (($19 == "53" || $20 == "53") && $21 != "") { dns_sum += ($21 + 0) * 1000.0; dns_n++ }
       if ($22 ~ /ECN SYN|AccECN/) ecn_out++
       if ($22 ~ /Accepted|SYN-ACK/) ecn_in++
+      if ($23 != "") sec_peers++
+      if ($24 != "") sec_anom++
     }
     END {
       ov4 = (out_v4 != "" ? out_v4 : "none")
@@ -2468,14 +2644,19 @@ pcap_audit() {
       irtt_short = (irtt_n > 0) ? sprintf("%.1fms", irtt_sum / irtt_n) : "n/a"
       dns_str    = (dns_n > 0)  ? sprintf("%.1f ms (n=%d)", dns_sum / dns_n, dns_n) : "cached/0"
       qos = (shaped == 1) ? sprintf("Fast-Lane(#10/#11)=%d pkts", fast_lane + 0) : sprintf("Interactive(DNS/ICMP/SSH/WG)=%d pkts (unshaped link)", fast_lane + 0)
-      printf "  Interface / File : %s → %s (snaplen=128B, %d pkts)\n", dev, pfile, total + 0
+      printf "  Interface / File : %s → %s (snaplen=576B, %d pkts)\n", cap_desc, pfile, total + 0
       printf "  Max L3 Packet    : %d B [IPv4=%dB, IPv6=%dB] (ceiling ≤ %d B, frag=%d)\n", max_l3 + 0, max_v4 + 0, max_v6 + 0, exp_mtu, frag + 0
       printf "  TCP SYN MSS      : out IPv4=%sB, out IPv6=%sB, inbound=%sB (ceiling ≤ %d/%dB, WScale=%d/%d)\n", ov4, ov6, im, exp_mss, exp_v6mss, wscale_cnt + 0, syn_cnt + 0
       printf "  Handshake & DNS  : TCP iRTT=%s | Unicast DNS RTT=%s\n", irtt_str, dns_str
       printf "  L4S / ECN & QoS  : SYN-ECN=%d out / %d accepted | ECT(1)=%d, ECT(0)=%d, CE=%d | %s\n", ecn_out + 0, ecn_in + 0, ect1 + 0, ect0 + 0, ce + 0, qos
       printf "  TCP Anomalies    : retrans=%d (fast=%d), dup_ack=%d, zero_win=%d, rst=%d\n", retrans + 0, fast_retrans + 0, dupack + 0, zerowin + 0, rst + 0
+      printf "  Overlay Security : watchlist_pkts=%d | anomalies=%d (PF Watchlist & Overlay Guard active)\n", sec_peers + 0, sec_anom + 0
       printf "  DHCP/BOOTP Pkts  : %d (rogue bootpd guard active)\n", dhcp + 0
-      printf "✓ Wire audit complete (%d pkts on %s, max L3=%d/%dB, out SYN MSS=%s/%sB, frag=%d, iRTT=%s, retrans=%d)\n", total + 0, dev, max_l3 + 0, exp_mtu, ov4, ov6, frag + 0, irtt_short, retrans + 0
+      printf "✓ Wire audit complete (%d pkts on %s, max L3=%d/%dB, out SYN MSS=%s/%sB, frag=%d, iRTT=%s, retrans=%d, sec_alerts=%d)\n", total + 0, cap_desc, max_l3 + 0, exp_mtu, ov4, ov6, frag + 0, irtt_short, retrans + 0, sec_anom + 0
+      if (jfile != "") {
+        printf "{\"ts\":%s,\"device\":\"%s\",\"ifaces\":\"%s\",\"file\":\"%s\",\"packets\":%d,\"max_l3\":%d,\"max_v4\":%d,\"max_v6\":%d,\"mtu_ceiling\":%d,\"fragmented\":%d,\"mss_out_v4\":\"%s\",\"mss_out_v6\":\"%s\",\"mss_in\":\"%s\",\"mss_ceiling_v4\":%d,\"mss_ceiling_v6\":%d,\"irtt\":\"%s\",\"dns_rtt\":\"%s\",\"retrans\":%d,\"fast_retrans\":%d,\"dup_ack\":%d,\"zero_win\":%d,\"reset\":%d,\"fast_lane\":%d,\"dhcp\":%d,\"watchlist_pkts\":%d,\"security_anomalies\":%d}\n", now_ts, dev, cap_desc, pfile, total + 0, max_l3 + 0, max_v4 + 0, max_v6 + 0, exp_mtu, frag + 0, ov4, ov6, im, exp_mss, exp_v6mss, irtt_short, dns_str, retrans + 0, fast_retrans + 0, dupack + 0, zerowin + 0, rst + 0, fast_lane + 0, dhcp + 0, sec_peers + 0, sec_anom + 0 > jfile
+        close(jfile)
+      }
     }
   ')
   printf '%s\n' "$audit_out" | sed '$d'
@@ -2503,13 +2684,125 @@ open_wireshark_gui() {
 }
 
 open_web_workbench() {
-  if [[ -f "$WEB_WORKBENCH_FILE" ]]; then
+  local mode="${1:-live}"
+  if [[ "$mode" == "--static" ]]; then
     /usr/bin/open "$WEB_WORKBENCH_FILE"
-    echo "Opened Tether-Optimize Product Workbench & Proof Explorer: $WEB_WORKBENCH_FILE"
-  else
-    echo "Error: Product workbench not found at $WEB_WORKBENCH_FILE" >&2
-    exit 1
+    echo "Opened static workbench copy: $WEB_WORKBENCH_FILE"
+    echo "Live telemetry needs the local server: tether-optimize web"
+    return 0
   fi
+  local web_dir
+  web_dir="$(dirname "$WEB_WORKBENCH_FILE")"
+  [[ -f "${web_dir}/serve.py" ]] || web_dir="${SCRIPT_DIR}/../web"
+  local server="${web_dir}/serve.py" index="${web_dir}/index.html"
+  if [[ ! -f "$server" || ! -f "$index" ]]; then
+    echo "Error: workbench assets missing (expected ${web_dir}/serve.py); re-run ./scripts/install.sh" >&2
+    return 1
+  fi
+  local py
+  py="$(command -v python3 || true)"
+  if [[ -z "$py" ]]; then
+    echo "python3 not found — opening the static workbench copy instead (no live telemetry)."
+    /usr/bin/open "$WEB_WORKBENCH_FILE"
+    return 0
+  fi
+
+  stop_web_workbench quiet
+
+  local pidf logf base port ready=0 pid
+  pidf="$(workbench_pid_file)"
+  logf="$(workbench_log_file)"
+  base="${WEB_WORKBENCH_PORT:-7180}"
+  for port in $(seq "$base" $((base + 10))); do
+    nohup "$py" "$server" --port "$port" --root "$web_dir" --state-dir "$STATE_DIR" \
+      --user-state "$USER_STATE_DIR" --config-dir "$CONFIG_DIR" --spec "$LEAN_SPEC_FILE" >>"$logf" 2>&1 &
+    pid=$!
+    ready=0
+    local _
+    for _ in $(seq 1 40); do
+      if /usr/bin/curl -fsS --max-time 1 "http://127.0.0.1:${port}/api/health" >/dev/null 2>&1; then
+        ready=1
+        break
+      fi
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ $ready -eq 1 ]]; then
+      printf '%s %s\n' "$pid" "$port" > "$pidf"
+      break
+    fi
+    kill "$pid" 2>/dev/null || true
+  done
+  if [[ $ready -ne 1 ]]; then
+    echo "Error: could not start the workbench server (see $logf)" >&2
+    return 1
+  fi
+  /usr/bin/open "http://127.0.0.1:${port}/"
+  echo "Live workbench: http://127.0.0.1:${port}/  (pid ${pid}, log ${logf})"
+  echo "Live state source: ${STATE_DIR}/ui.snapshot + shaper.state + live sysctl"
+  echo "Stop it with: tether-optimize web-stop"
+}
+
+show_watchlist() {
+  echo "Peer watchlist: ${WATCHLIST_FILE}"
+  if [[ ! -r "$WATCHLIST_FILE" ]]; then
+    echo "  (missing — no peer rules are emitted; copy config/watchlist.conf from the repo or re-run the installer)"
+    return 0
+  fi
+  local entries count
+  entries=$(watchlist_entries)
+  count=$(printf '%s\n' "$entries" | grep -c . || true)
+  if [[ "$count" -eq 0 ]]; then
+    echo "  (empty — only the loopback and overlay guards are enforced)"
+  else
+    echo "  ${count} entr$([[ $count -eq 1 ]] && echo y || echo ies)"
+    printf '%s\n' "$entries" | while IFS='|' read -r addr dir proto extra; do
+      printf '    %-42s %-4s %-5s %s\n' "$addr" "$dir" "$proto" "$extra"
+    done
+  fi
+  echo
+  echo "Generated PF rules:"
+  emit_watchlist_rules | sed 's/^/  /' || true
+}
+
+workbench_run_dir() {
+  local base="${TMPDIR:-/tmp}" dir
+  base="${base%/}"
+  dir="${base}/tether-optimize-workbench.$(id -u)"
+  if [[ ! -d "$dir" ]]; then
+    mkdir -m 700 "$dir" 2>/dev/null || dir="/tmp/tether-optimize-workbench.$(id -u)"
+  fi
+  printf '%s\n' "$dir"
+}
+
+workbench_pid_file() {
+  printf '%s/server.pid\n' "$(workbench_run_dir)"
+}
+
+workbench_log_file() {
+  printf '%s/server.log\n' "$(workbench_run_dir)"
+}
+
+stop_web_workbench() {
+  local quiet="${1:-}" pidf pid
+  pidf="$(workbench_pid_file)"
+  if [[ ! -f "$pidf" ]]; then
+    [[ -z "$quiet" ]] && echo "Workbench server is not running."
+    return 0
+  fi
+  pid="$(awk '{print $1}' "$pidf")"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    # Only signal it if it is still our server: PIDs get recycled.
+    if ps -p "$pid" -o command= 2>/dev/null | grep -q 'serve\.py'; then
+      kill "$pid" 2>/dev/null || true
+      [[ -z "$quiet" ]] && echo "Stopped workbench server (pid ${pid})."
+    else
+      [[ -z "$quiet" ]] && echo "Pid ${pid} is no longer the workbench server; leaving it alone."
+    fi
+  else
+    [[ -z "$quiet" ]] && echo "Workbench server is not running."
+  fi
+  rm -f "$pidf"
 }
 
 version_cli() {
@@ -2531,7 +2824,7 @@ doctor_cli() {
   echo "  [4] Native Menubar App     : $([[ -x "${MENUBAR_APP}/Contents/MacOS/tether-menubar" ]] && pgrep -x tether-menubar >/dev/null 2>&1 && echo "RUNNING (${MENUBAR_APP})" || echo "STOPPED")"
   echo "  [5] Lean 4 Prover & Spec   : $([[ -f "$LEAN_SPEC_FILE" ]] && echo "READY (110 zero-axiom theorems)" || echo "MISSING")"
   echo "  [6] Wireshark & Lua Plugin : $(command -v tshark >/dev/null 2>&1 && [[ -r /dev/bpf0 ]] && echo "READY (ChmodBPF + tether.icmp_owd)" || echo "UNAVAILABLE")"
-  echo "  [7] Web Product Workbench  : $([[ -f "$WEB_WORKBENCH_FILE" ]] && echo "READY (${WEB_WORKBENCH_FILE})" || echo "MISSING")"
+  echo "  [7] Web Product Workbench  : $([[ -f "$WEB_WORKBENCH_FILE" ]] && echo "READY (${WEB_WORKBENCH_FILE})" || echo "MISSING") | live server: $([[ -f "$(dirname "$WEB_WORKBENCH_FILE")/serve.py" ]] && echo "READY" || echo "MISSING") | assets: $([[ -f "$(dirname "$WEB_WORKBENCH_FILE")/static/app.js" && -f "$(dirname "$WEB_WORKBENCH_FILE")/static/app.css" ]] && echo "READY" || echo "MISSING")"
 }
 
 run_self_tests() {
@@ -2645,8 +2938,8 @@ EOF
     "[[ -f \"\${WIRESHARK_SKILL_DIR}/pcap_quick_triage.py\" && -f \"\${WIRESHARK_SKILL_DIR}/tcp_latency_analyzer.py\" ]]"
   assert_ok "Daemon hardware-port cache & batched 17-key sysctl optimization active" \
     "grep -q 'refresh_hardware_port_cache' \"\$SCRIPT_PATH\" && grep -q 'net.inet.tcp.delayed_ack=3 \\\\' \"\$SCRIPT_PATH\""
-  assert_ok "Fast event-driven IPC sync (wait_for_daemon_sync) & zero background dumpcap in standby" \
-    "grep -q 'state_ts >= prefs_ts' \"\$SCRIPT_PATH\" && ! pgrep -x dumpcap >/dev/null 2>&1"
+  assert_ok "Fast event-driven IPC sync (wait_for_daemon_sync) & zero orphan audit dumpcap" \
+    "grep -q 'state_ts >= prefs_ts' \"\$SCRIPT_PATH\" && ! pgrep -f \"dumpcap.*\${LAST_PCAP_FILE}\" >/dev/null 2>&1"
   assert_ok "Attached-only USB service guard (iface_exists + service_for_device) skips unplugged & shadow USB stalls" \
     "grep -q 'for dev in en7 en17 en9; do' \"\$SCRIPT_PATH\" && grep -q 'iface_exists \"\$dev\" || continue' \"\$SCRIPT_PATH\""
   local t_proxy_s t_proxy_e
@@ -2723,6 +3016,28 @@ EOF
     "tshark -G fields 2>/dev/null | grep -q 'tether.icmp_owd' && grep -q 'fasttick|' \"\$EVENTS_SRC\""
   assert_ok "Portable product packaging (v${VERSION}, resolve_user_home, installer & web workbench) ready" \
     "[[ \"\$VERSION\" == '1.0.0' && -d \"\$TETHER_USER_HOME\" && -f \"\$WEB_WORKBENCH_FILE\" ]]"
+  local pf_test_tmp="/tmp/tether-pf-selftest.$$.conf" pf_hs_tmp="/tmp/tether-pf-hs-selftest.$$.conf"
+  emit_common_pf_tail 1332 > "$pf_test_tmp"
+  {
+    echo "scrub on en0 inet all max-mss ${HOTSPOT_MSS}"
+    echo "scrub on en0 inet6 all max-mss ${HOTSPOT_MSS}"
+    emit_common_pf_tail "$OVERLAY_MSS"
+    emit_dummynet_rules_for_dev en0
+  } | awk '
+    /^#/ || /^scrub / { scrub[++ns] = $0; next }
+    /^dummynet /      { dn[++nd] = $0; next }
+    { flt[++nf] = $0 }
+    END {
+      for (i = 1; i <= ns; i++) print scrub[i]
+      for (i = 1; i <= nd; i++) print dn[i]
+      for (i = 1; i <= nf; i++) print flt[i]
+    }
+  ' > "$pf_hs_tmp"
+  assert_ok "Home & Hotspot+Dummynet PF tails pass pfctl -nf & emit bidirectional watchlist (.126/.140/.152/.156/.195) + one-way .169 + feth* all-SYN + utun* port list" \
+    "/sbin/pfctl -o none -nf \"\$pf_test_tmp\" >/dev/null 2>&1 && /sbin/pfctl -o none -nf \"\$pf_hs_tmp\" >/dev/null 2>&1 && grep -q 'block drop in quick inet from { 192\.168\.3\.195, 192\.168\.3\.156, 192\.168\.3\.126, 192\.168\.3\.140, 192\.168\.3\.152 } to any' \"\$pf_test_tmp\" && grep -q 'block drop out quick inet from any to { 192\.168\.3\.195, 192\.168\.3\.156, 192\.168\.3\.126, 192\.168\.3\.140, 192\.168\.3\.152 }' \"\$pf_test_tmp\" && grep -q '^block drop in quick inet proto udp from 192\.168\.3\.169 to any$' \"\$pf_test_tmp\" && grep -q '^block drop in quick inet proto tcp from 192\.168\.3\.169 to any flags S/SA$' \"\$pf_test_tmp\" && grep -q '^block drop in quick inet proto icmp from 192\.168\.3\.169 to any icmp-type echoreq$' \"\$pf_test_tmp\" && ! grep -q '^block drop in quick inet from 192\.168\.3\.169 to any$' \"\$pf_test_tmp\" && ( ! iface_exists feth110 || grep -q '^block drop in quick on feth110 proto tcp from any to any flags S/SA$' \"\$pf_test_tmp\" ) && ( ! iface_exists feth5110 || grep -q '^block drop in quick on feth5110 proto tcp from any to any flags S/SA$' \"\$pf_test_tmp\" ) && ( ! iface_exists utun14 || grep -q '^block drop in quick on utun14 proto tcp from any to any port {' \"\$pf_test_tmp\" ) && ! grep -q 'on en0 proto tcp' \"\$pf_test_tmp\" && grep -q '5353' \"\$pf_test_tmp\" && grep -q '7100' \"\$pf_test_tmp\""
+  rm -f "$pf_test_tmp" "$pf_hs_tmp"
+  assert_ok "Wireshark Lua post-dissector registers tether.security.severity & tether.tailscale.disco fields" \
+    "tshark -G fields 2>/dev/null | grep -q 'tether.security.severity' && tshark -G fields 2>/dev/null | grep -q 'tether.tailscale.disco'"
 
   # Group E: Live Kernel / Sysctl / Interface / Firewall Invariants (single batched sysctl read)
   local sys_vals
@@ -2741,6 +3056,8 @@ EOF
     "[[ \"\$cur_l4s\" == \"1\" && \"\$cur_ecn\" == \"1\" ]]"
   assert_ok "Local-service firewall guard blocks non-loopback ports 3000 & 11434" \
     "grep -q 'port = 3000' \"\$SHAPER_STATE_FILE\" 2>/dev/null && grep -q 'port = 11434' \"\$SHAPER_STATE_FILE\" 2>/dev/null"
+  assert_ok "Peer watchlist from ${WATCHLIST_FILE} is loaded into the PF guard + overlay TCP/UDP guards + Lua security fields" \
+    "watchlist_loaded && ( ! iface_exists feth110 || grep -qE '^block drop in quick on feth110 proto tcp (all|from any to any) flags S/SA$' \"\$SHAPER_STATE_FILE\" 2>/dev/null ) && ( ! iface_exists feth5110 || grep -qE '^block drop in quick on feth5110 proto tcp (all|from any to any) flags S/SA$' \"\$SHAPER_STATE_FILE\" 2>/dev/null ) && tshark -G fields 2>/dev/null | grep -q 'tether.security.suspect_peer'"
   assert_ok "en9 LAN segment is excluded from bridge100 (DHCP bootpd protection)" \
     "! /sbin/ifconfig bridge100 2>/dev/null | grep -q 'member: en9'"
 
@@ -2825,7 +3142,10 @@ case "$MODE" in
   owd-probe) owd_probe_cli ;;
   tail-mle) tail_mle_cli "${TAIL_MLE_ARGS[@]+"${TAIL_MLE_ARGS[@]}"}" ;;
   wireshark-gui) open_wireshark_gui ;;
-  web|workbench) open_web_workbench ;;
+  web|workbench) open_web_workbench "$WEB_ARG" ;;
+  web-stop) stop_web_workbench ;;
+  watchlist) show_watchlist ;;
+  __emit_rules) emit_common_pf_tail "${EMIT_MSS:-$HOTSPOT_MSS}" ;;
   doctor) doctor_cli ;;
   version) version_cli ;;
   verify) verify_lean; run_self_tests ;;

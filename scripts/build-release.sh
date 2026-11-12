@@ -4,11 +4,14 @@ set -euo pipefail
 export COPYFILE_DISABLE=1
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="1.0.0"
+VERSION="1.1.0"
 DIST_DIR="${REPO_ROOT}/dist"
 STAGE_DIR="/tmp/tether-optimize-pkg-stage.$$"
 PKG_ROOT="${STAGE_DIR}/root"
 PKG_SCRIPTS="${STAGE_DIR}/scripts"
+
+# Never ship local caches or site-local peer data
+find "${REPO_ROOT}" -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
 rm -rf "${STAGE_DIR}"
 mkdir -p "${DIST_DIR}" "${PKG_ROOT}/usr/local/share/tether-optimize" "${PKG_SCRIPTS}"
@@ -16,7 +19,7 @@ mkdir -p "${DIST_DIR}" "${PKG_ROOT}/usr/local/share/tether-optimize" "${PKG_SCRI
 echo "=== Building Tether-Optimize v${VERSION} Release Artifacts ==="
 
 # 1. Compile universal/native release binaries into staging tree
-mkdir -p "${PKG_ROOT}/usr/local/share/tether-optimize/"{bin,src,proofs,wireshark,launchd,scripts,web,paper}
+mkdir -p "${PKG_ROOT}/usr/local/share/tether-optimize/"{bin,src,proofs,wireshark,launchd,scripts,web,config,paper}
 cp -R "${REPO_ROOT}/bin/"* "${PKG_ROOT}/usr/local/share/tether-optimize/bin/"
 cp -R "${REPO_ROOT}/src/"* "${PKG_ROOT}/usr/local/share/tether-optimize/src/"
 cp -R "${REPO_ROOT}/proofs/"* "${PKG_ROOT}/usr/local/share/tether-optimize/proofs/"
@@ -24,6 +27,8 @@ cp -R "${REPO_ROOT}/wireshark/"* "${PKG_ROOT}/usr/local/share/tether-optimize/wi
 cp -R "${REPO_ROOT}/launchd/"* "${PKG_ROOT}/usr/local/share/tether-optimize/launchd/"
 cp -R "${REPO_ROOT}/scripts/"* "${PKG_ROOT}/usr/local/share/tether-optimize/scripts/"
 cp -R "${REPO_ROOT}/web/"* "${PKG_ROOT}/usr/local/share/tether-optimize/web/"
+cp -R "${REPO_ROOT}/config/watchlist.conf" "${PKG_ROOT}/usr/local/share/tether-optimize/config/"
+cp -R "${REPO_ROOT}/config/peers.example.lua" "${PKG_ROOT}/usr/local/share/tether-optimize/config/"
 [[ -d "${REPO_ROOT}/paper" ]] && cp -R "${REPO_ROOT}/paper/"* "${PKG_ROOT}/usr/local/share/tether-optimize/paper/"
 [[ -f "${REPO_ROOT}/README.md" ]] && cp "${REPO_ROOT}/README.md" "${PKG_ROOT}/usr/local/share/tether-optimize/README.md"
 [[ -f "${REPO_ROOT}/Makefile" ]] && cp "${REPO_ROOT}/Makefile" "${PKG_ROOT}/usr/local/share/tether-optimize/Makefile"

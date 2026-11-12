@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Zero-dependency macOS installer for Tether-Optimize v1.0.0
+# install.sh — Zero-dependency macOS installer for Tether-Optimize v1.1.0
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,7 +11,7 @@ APP_DIR="${USER_HOME}/Applications/TetherMenubar.app"
 WIRESHARK_PLUGIN_DIR="${USER_HOME}/.local/lib/wireshark/plugins"
 LAUNCH_AGENT_DIR="${USER_HOME}/Library/LaunchAgents"
 
-echo "=== Installing Tether-Optimize v1.0.0 ==="
+echo "=== Installing Tether-Optimize v1.1.0 ==="
 echo "  Target User : ${TARGET_USER} (${USER_HOME})"
 echo "  Binary Dir  : ${BIN_DIR}"
 echo "  Menubar App : ${APP_DIR}"
@@ -32,6 +32,37 @@ chmod 644 "/tmp/TetherOptimizeSpec.lean.$$"
 mv -f "/tmp/TetherOptimizeSpec.lean.$$" "${BIN_DIR}/TetherOptimizeSpec.lean"
 
 cp -f "${REPO_ROOT}/wireshark/tether_optimize.lua" "${WIRESHARK_PLUGIN_DIR}/tether_optimize.lua"
+
+# 1b. Web workbench: page, static assets and loopback telemetry server in the product tree
+stage_asset() {  # stage in /tmp first so a root-owned previous copy can be replaced
+  local src="$1" dest="$2" tmp
+  tmp="/tmp/tether-web-$(basename "$dest").$$"
+  cp -f "$src" "$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+WEB_TARGET_DIR="${USER_HOME}/tether-optimize/web"
+mkdir -p "${WEB_TARGET_DIR}/static"
+stage_asset "${REPO_ROOT}/web/index.html"      "${WEB_TARGET_DIR}/index.html"
+stage_asset "${REPO_ROOT}/web/serve.py"        "${WEB_TARGET_DIR}/serve.py"
+stage_asset "${REPO_ROOT}/web/static/app.css"  "${WEB_TARGET_DIR}/static/app.css"
+stage_asset "${REPO_ROOT}/web/static/app.js"   "${WEB_TARGET_DIR}/static/app.js"
+chmod 755 "${WEB_TARGET_DIR}/serve.py"
+
+# 1c. Site-local peer data: ship the empty watchlist template once, then respect
+#     the operator's own file; local peer labels go next to the Lua plugin.
+CONFIG_TARGET_DIR="${USER_HOME}/.config/tether-optimize"
+mkdir -p "${CONFIG_TARGET_DIR}"
+if [[ ! -f "${CONFIG_TARGET_DIR}/watchlist.conf" ]]; then
+  stage_asset "${REPO_ROOT}/config/watchlist.conf" "${CONFIG_TARGET_DIR}/watchlist.conf"
+fi
+if [[ -f "${REPO_ROOT}/config/watchlist.local.conf" ]]; then
+  stage_asset "${REPO_ROOT}/config/watchlist.local.conf" "${CONFIG_TARGET_DIR}/watchlist.conf"
+fi
+if [[ -f "${REPO_ROOT}/config/peers.local.lua" ]]; then
+  stage_asset "${REPO_ROOT}/config/peers.local.lua" "${WIRESHARK_PLUGIN_DIR}/tether_peers.lua"
+fi
 
 # 2. Compile native ARM64/x86_64 binaries via Apple Command Line Tools swiftc
 echo "  Compiling tether-events (XNU kqueue + PF_ROUTE + BSD IPPROTO_ICMP OWD reactor)…"
@@ -54,7 +85,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<'EOF'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.0</string>
+  <string>1.1.0</string>
   <key>CFBundleVersion</key>
   <string>100</string>
   <key>LSUIElement</key>
@@ -84,5 +115,5 @@ launchctl bootout "gui/${USER_UID}/com.josaum.tether-menubar" 2>/dev/null || tru
 launchctl bootstrap "gui/${USER_UID}" "${LAUNCH_AGENT_DIR}/com.josaum.tether-menubar.plist" 2>/dev/null || true
 launchctl kickstart -k "gui/${USER_UID}/com.josaum.tether-menubar" 2>/dev/null || true
 
-echo "✓ Tether-Optimize v1.0.0 installed."
+echo "✓ Tether-Optimize v1.1.0 installed."
 echo "  Run '${BIN_DIR}/tether-optimize doctor' or '${BIN_DIR}/tether-optimize verify' to verify."

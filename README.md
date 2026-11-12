@@ -1,4 +1,4 @@
-# Mirabilis-Tether (`tether-optimize` v1.0.0)
+# Mirabilis-Tether (`tether-optimize` v1.1.0)
 ### *Mirabilis Abbreviatio* — Formally Verified macOS Personal Hotspot & WAN Optimizer
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24100456.svg)](https://doi.org/10.5281/zenodo.24100456)
@@ -45,7 +45,7 @@ All measurements below were executed live on an **Apple M1 Mac** (`macOS 26.5.2`
 
 ### 2.1 Live System & Kernel Microbenchmarks (Measured on Apple M1)
 
-| Subsystem / Operation | Legacy / Baseline Approach | Mirabilis-Tether (`v1.0.0`) | Measured Result / Speedup | Reproducibility Command |
+| Subsystem / Operation | Legacy / Baseline Approach | Mirabilis-Tether (`v1.1.0`) | Measured Result / Speedup | Reproducibility Command |
 | :--- | :--- | :--- | :--- | :--- |
 | **64-bit Interface Byte Sensing** | Forking `/usr/sbin/netstat -ibn` (`5.41 ms` / call) | In-process `sysctl(NET_RT_IFLIST2)` (`if_msghdr2`) | **`7.8 µs` / call (`697×` faster, `0` forks)** | `tether-events --probe en0` |
 | **Idle Daemon CPU & Memory** | Polling shell loops (`0.4%` CPU, `20` pings/min) | `kqueue` + `AF_ROUTE` (`tether-events`) | **`0.0%` CPU, `2.64 MB` RSS (`2,704 KB`), `0` idle pings** | `ps -o pid,%cpu,rss,comm -p $(pgrep -x tether-events)` |
@@ -93,7 +93,7 @@ tether-optimize/
 │   ├── mirabilis_tether.tex                  # LaTeX source of the research paper
 │   └── MIRABILIS_TETHER_PAPER.md             # GitHub-rendered Markdown edition of the paper
 ├── bin/
-│   ├── tether-optimize                       # Portable CLI & root daemon engine (v1.0.0)
+│   ├── tether-optimize                       # Portable CLI & root daemon engine (v1.1.0)
 │   └── tether-events                         # Compiled XNU kqueue + RFC 792 OWD reactor
 ├── src/
 │   ├── tether-events.swift                   # XNU kqueue + PF_ROUTE + RFC 792 OWD reactor source
@@ -109,11 +109,21 @@ tether-optimize/
 │   ├── install.sh                            # Zero-dependency macOS installer
 │   ├── uninstall.sh                          # Clean uninstaller & profile restorer
 │   └── build-release.sh                      # Builds macOS .pkg + .tar.gz + SHA256SUMS.txt
+├── config/
+│   ├── watchlist.conf                        # Empty peer-watchlist template (site-local, one host per line)
+│   └── peers.example.lua                     # Schema for site-local Wireshark peer labels
+├── tests/
+│   ├── test_workbench.py                     # Server parser & snapshot unit tests
+│   └── test_watchlist.py                     # Watchlist emitter + no-personal-data guard
 ├── web/
-│   └── index.html                            # Interactive Product Landing Page & Hamiltonian Workbench
+│   ├── index.html                            # Markup-only workbench page
+│   ├── serve.py                              # Loopback telemetry server (/api/snapshot, /api/history, /api/rules)
+│   └── static/
+│       ├── app.css                           # Styling and design tokens
+│       └── app.js                            # Live polling, charts, model math, theorem browser
 └── dist/
-    ├── TetherOptimize-1.0.0-macos-arm64.pkg
-    ├── TetherOptimize-1.0.0-macos-arm64.tar.gz
+    ├── TetherOptimize-1.1.0-macos-arm64.pkg
+    ├── TetherOptimize-1.1.0-macos-arm64.tar.gz
     └── SHA256SUMS.txt
 ```
 
@@ -129,13 +139,33 @@ cd ~/tether-optimize
 ./scripts/install.sh
 ```
 
+### Site-Local Peer Watchlist
+
+Firewall peer rules are **not** hardcoded. `~/.config/tether-optimize/watchlist.conf`
+starts empty and accepts one host per line:
+
+```
+<address-or-cidr>   [in|out|both]   [all|tcp|udp|icmp]   [syn]
+
+192.0.2.50                 # both directions, every protocol
+192.0.2.60   in    udp     # inbound UDP only
+192.0.2.61   in    tcp syn # inbound connection attempts only
+```
+
+`tether-optimize watchlist` prints the parsed entries and the exact PF rules they
+produce. Wireshark peer labels live beside the plugin in `tether_peers.lua`
+(see `config/peers.example.lua`); without it the dissector reports no named peers.
+Both files are site-local and git-ignored.
+
 ### Everyday Commands
 
 ```bash
 tether-optimize status          # Concise status (link, Pontryagin u*(λ), OWD, Taleb α̂₀, TCP, VPNs)
 tether-optimize doctor          # Full environment & component readiness diagnostic
 tether-optimize version         # Show product version & paths
-tether-optimize web             # Open interactive Product Landing Page & Hamiltonian Workbench
+tether-optimize web             # Serve the live workbench on 127.0.0.1:7180 and open it (--static: file copy)
+tether-optimize web-stop        # Stop the local workbench server
+tether-optimize watchlist       # Show the site-local peer watchlist and the PF rules it produces
 tether-optimize owd-probe       # Run live 3-reflector RFC 792 One-Way Delay quorum probe
 tether-optimize tail-mle        # Run Taleb InvGamma(n, nα) MLE & Pontryagin control diagnostic
 tether-optimize pcap 4          # Run 4s header-only Wireshark (dumpcap/tshark/Lua) wire audit
@@ -143,7 +173,7 @@ tether-optimize cap 40 12       # Live-update hotspot ceiling to 40 Mbps down / 
 tether-optimize unshape         # Disable dummynet bandwidth cap (keep TCP/MSS/AWDL/QoS)
 tether-optimize shape           # Re-enable dummynet bandwidth cap
 tether-optimize restore         # Force Standard Home Wi-Fi / LAN profile
-tether-optimize verify          # Run all 110 Lean 4 proofs + 72 live system assertions
+tether-optimize verify          # Run all 110 Lean 4 proofs + 85 live system assertions
 ```
 
 ---
@@ -158,17 +188,26 @@ To independently verify the entire mathematical specification and live kernel in
    ```
    Expected output: `All 110 tether-optimize formal specification theorems verified (0 axioms).`
 
-2. **Live System & Unit Invariant Suite**:
+2. **Unit tests and the no-personal-data guard** (no root required):
+   ```bash
+   python3 -m unittest discover -s tests -v
+   ```
+   Covers the workbench parsers (theorem catalog, PF rule grouping, sysctl
+   applied-vs-live expectations, snapshot assembly), the watchlist rule emitter,
+   and a guard that fails if a real LAN address, hostname or hardware address ever
+   reappears in shipped files.
+
+3. **Live System & Unit Invariant Suite**:
    ```bash
    tether-optimize test
    ```
-   Expected output: `✓ 72/72 live system & unit assertions passed (0 failed)`
+   Expected output: `✓ 85/85 live system & unit assertions passed (0 failed)`
 
-3. **Distributable Package Build**:
+4. **Distributable Package Build**:
    ```bash
    make pkg
    ```
-   Produces `dist/TetherOptimize-1.0.0-macos-arm64.pkg`, `dist/TetherOptimize-1.0.0-macos-arm64.tar.gz`, and `dist/SHA256SUMS.txt`.
+   Produces `dist/TetherOptimize-1.1.0-macos-arm64.pkg`, `dist/TetherOptimize-1.1.0-macos-arm64.tar.gz`, and `dist/SHA256SUMS.txt`.
 
 ---
 
@@ -193,7 +232,7 @@ To independently verify the entire mathematical specification and live kernel in
   year         = {2026},
   month        = nov,
   publisher    = {Zenodo},
-  version      = {1.0.0},
+  version      = {1.1.0},
   doi          = {10.5281/zenodo.24100456},
   url          = {https://doi.org/10.5281/zenodo.24100456}
 }

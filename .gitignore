@@ -1,2 +1,8 @@
 .leio-code/
 .DS_Store
+__pycache__/
+*.pyc
+
+# Site-local peer data: real addresses and labels stay off the public repo
+config/*.local.conf
+config/*.local.lua

@@ -510,10 +510,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
             if includePing {
                 let targetIp: String
-                if next.ipAddress.hasPrefix("172.20.10.") {
-                    targetIp = "172.20.10.1"
-                } else if next.ipAddress.hasPrefix("192.168.15.") {
-                    targetIp = "192.168.15.1"
+                // Ping the local gateway of a private IPv4 subnet, else a public resolver.
+                let octets = next.ipAddress.split(separator: ".")
+                if octets.count == 4, let first = Int(octets[0]),
+                   first == 10 || (first == 172 && Int(octets[1]).map { (16...31).contains($0) } == true)
+                   || (first == 192 && Int(octets[1]) == 168) {
+                    targetIp = "\(octets[0]).\(octets[1]).\(octets[2]).1"
                 } else {
                     targetIp = "1.1.1.1"
                 }
