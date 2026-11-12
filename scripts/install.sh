@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Zero-dependency macOS installer for Tether-Optimize v1.1.0
+# install.sh — Zero-dependency macOS installer for Tether-Optimize v1.1.1
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,7 +11,7 @@ APP_DIR="${USER_HOME}/Applications/TetherMenubar.app"
 WIRESHARK_PLUGIN_DIR="${USER_HOME}/.local/lib/wireshark/plugins"
 LAUNCH_AGENT_DIR="${USER_HOME}/Library/LaunchAgents"
 
-echo "=== Installing Tether-Optimize v1.1.0 ==="
+echo "=== Installing Tether-Optimize v1.1.1 ==="
 echo "  Target User : ${TARGET_USER} (${USER_HOME})"
 echo "  Binary Dir  : ${BIN_DIR}"
 echo "  Menubar App : ${APP_DIR}"
@@ -85,7 +85,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<'EOF'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.1.0</string>
+  <string>1.1.1</string>
   <key>CFBundleVersion</key>
   <string>100</string>
   <key>LSUIElement</key>
@@ -115,5 +115,5 @@ launchctl bootout "gui/${USER_UID}/com.josaum.tether-menubar" 2>/dev/null || tru
 launchctl bootstrap "gui/${USER_UID}" "${LAUNCH_AGENT_DIR}/com.josaum.tether-menubar.plist" 2>/dev/null || true
 launchctl kickstart -k "gui/${USER_UID}/com.josaum.tether-menubar" 2>/dev/null || true
 
-echo "✓ Tether-Optimize v1.1.0 installed."
+echo "✓ Tether-Optimize v1.1.1 installed."
 echo "  Run '${BIN_DIR}/tether-optimize doctor' or '${BIN_DIR}/tether-optimize verify' to verify."

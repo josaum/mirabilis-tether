@@ -194,7 +194,7 @@ section {
 /* Hero */
 .hero-grid {
   display: grid;
-  grid-template-columns: 1.15fr 0.85fr;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
   gap: 28px;
   align-items: stretch;
   margin-top: 12px;
@@ -301,7 +301,7 @@ h1 {
 
 .duel-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
   margin-bottom: 12px;
 }
@@ -376,7 +376,7 @@ h2 {
 /* Workbench Cards */
 .workbench-grid {
   display: grid;
-  grid-template-columns: 1fr 1.15fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
   gap: 22px;
 }
 
@@ -449,7 +449,7 @@ input[type="range"] {
 
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -574,11 +574,12 @@ td {
 /* Code Snippets with 1-Click Copy */
 .cli-grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
 
 .code-card {
+  min-width: 0;
   background: var(--bg-card);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
@@ -589,9 +590,20 @@ td {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 10px;
   margin-bottom: 8px;
   font-size: 0.82rem;
   color: var(--text-muted);
+  min-width: 0;
+}
+
+.code-card-header > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.code-card-header .copy-btn {
+  flex: 0 0 auto;
 }
 
 .copy-btn {
@@ -635,7 +647,7 @@ pre {
 
 .theorem-list {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   max-height: 360px;
   overflow-y: auto;
@@ -660,7 +672,7 @@ pre {
 /* Fold 7 Tiers */
 .tier-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 18px;
   margin-top: 18px;
 }
@@ -707,7 +719,7 @@ footer {
 /* Fold 0: Live system dashboard */
 .live-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
 }
 
@@ -934,7 +946,7 @@ footer {
 
 .trend-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 16px;
 }
 
@@ -990,12 +1002,21 @@ footer {
 }
 
 @media (max-width: 940px) {
+  .cli-grid,
+  .tier-grid,
+  .duel-row,
+  .hero-grid,
+  .workbench-grid,
+  .kpi-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .live-grid {
     grid-template-columns: 1fr;
   }
 
   .trend-grid {
-    grid-template-columns: repeat(2, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 

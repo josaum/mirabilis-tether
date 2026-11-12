@@ -4,7 +4,7 @@ set -euo pipefail
 export COPYFILE_DISABLE=1
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="1.1.0"
+VERSION="1.1.1"
 DIST_DIR="${REPO_ROOT}/dist"
 STAGE_DIR="/tmp/tether-optimize-pkg-stage.$$"
 PKG_ROOT="${STAGE_DIR}/root"

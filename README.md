@@ -1,4 +1,4 @@
-# Mirabilis-Tether (`tether-optimize` v1.1.0)
+# Mirabilis-Tether (`tether-optimize` v1.1.1)
 ### *Mirabilis Abbreviatio* — Formally Verified macOS Personal Hotspot & WAN Optimizer
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24100456.svg)](https://doi.org/10.5281/zenodo.24100456)
@@ -45,7 +45,7 @@ All measurements below were executed live on an **Apple M1 Mac** (`macOS 26.5.2`
 
 ### 2.1 Live System & Kernel Microbenchmarks (Measured on Apple M1)
 
-| Subsystem / Operation | Legacy / Baseline Approach | Mirabilis-Tether (`v1.1.0`) | Measured Result / Speedup | Reproducibility Command |
+| Subsystem / Operation | Legacy / Baseline Approach | Mirabilis-Tether (`v1.1.1`) | Measured Result / Speedup | Reproducibility Command |
 | :--- | :--- | :--- | :--- | :--- |
 | **64-bit Interface Byte Sensing** | Forking `/usr/sbin/netstat -ibn` (`5.41 ms` / call) | In-process `sysctl(NET_RT_IFLIST2)` (`if_msghdr2`) | **`7.8 µs` / call (`697×` faster, `0` forks)** | `tether-events --probe en0` |
 | **Idle Daemon CPU & Memory** | Polling shell loops (`0.4%` CPU, `20` pings/min) | `kqueue` + `AF_ROUTE` (`tether-events`) | **`0.0%` CPU, `2.64 MB` RSS (`2,704 KB`), `0` idle pings** | `ps -o pid,%cpu,rss,comm -p $(pgrep -x tether-events)` |
@@ -93,7 +93,7 @@ tether-optimize/
 │   ├── mirabilis_tether.tex                  # LaTeX source of the research paper
 │   └── MIRABILIS_TETHER_PAPER.md             # GitHub-rendered Markdown edition of the paper
 ├── bin/
-│   ├── tether-optimize                       # Portable CLI & root daemon engine (v1.1.0)
+│   ├── tether-optimize                       # Portable CLI & root daemon engine (v1.1.1)
 │   └── tether-events                         # Compiled XNU kqueue + RFC 792 OWD reactor
 ├── src/
 │   ├── tether-events.swift                   # XNU kqueue + PF_ROUTE + RFC 792 OWD reactor source
@@ -122,8 +122,8 @@ tether-optimize/
 │       ├── app.css                           # Styling and design tokens
 │       └── app.js                            # Live polling, charts, model math, theorem browser
 └── dist/
-    ├── TetherOptimize-1.1.0-macos-arm64.pkg
-    ├── TetherOptimize-1.1.0-macos-arm64.tar.gz
+    ├── TetherOptimize-1.1.1-macos-arm64.pkg
+    ├── TetherOptimize-1.1.1-macos-arm64.tar.gz
     └── SHA256SUMS.txt
 ```
 
@@ -207,7 +207,7 @@ To independently verify the entire mathematical specification and live kernel in
    ```bash
    make pkg
    ```
-   Produces `dist/TetherOptimize-1.1.0-macos-arm64.pkg`, `dist/TetherOptimize-1.1.0-macos-arm64.tar.gz`, and `dist/SHA256SUMS.txt`.
+   Produces `dist/TetherOptimize-1.1.1-macos-arm64.pkg`, `dist/TetherOptimize-1.1.1-macos-arm64.tar.gz`, and `dist/SHA256SUMS.txt`.
 
 ---
 
@@ -232,7 +232,7 @@ To independently verify the entire mathematical specification and live kernel in
   year         = {2026},
   month        = nov,
   publisher    = {Zenodo},
-  version      = {1.1.0},
+  version      = {1.1.1},
   doi          = {10.5281/zenodo.24100456},
   url          = {https://doi.org/10.5281/zenodo.24100456}
 }
