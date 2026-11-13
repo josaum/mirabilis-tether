@@ -729,7 +729,7 @@ def canModifyRootExecutable (owner : FileOwner) (caller : CallerPrivilege) : Boo
   | .unprivUser, .rootDaemon    => true
   | .unprivUser, .unprivProcess => true
 
-/-- Validated preference IPC state parsed from `/Users/josaum/.tether-optimize.prefs`. -/
+/-- Validated preference IPC state parsed from `~/.tether-optimize.prefs`. -/
 structure ValidatedPrefs where
   downMbps      : Nat
   upMbps        : Nat
@@ -747,7 +747,7 @@ def applyPrefsIpc (rawDown rawUp : Nat) (shape : Bool) : ValidatedPrefs := {
   scriptOwner  := .rootWheel
 }
 
-/-- Theorem 31 (LaunchDaemon Privilege Escalation Prevention): When `/Users/josaum/bin/tether-optimize`
+/-- Theorem 31 (LaunchDaemon Privilege Escalation Prevention): When `~/bin/tether-optimize`
     is owned by `root:wheel` (`.rootWheel`), no unprivileged process (`.unprivProcess`) can
     modify the root daemon executable (`canModifyRootExecutable .rootWheel .unprivProcess = false`). -/
 theorem root_owned_script_blocks_unprivileged_modification :
@@ -755,7 +755,7 @@ theorem root_owned_script_blocks_unprivileged_modification :
   rfl
 
 /-- Theorem 32 (Zero-Password Prefs IPC Safety): Updating user preferences via
-    `/Users/josaum/.tether-optimize.prefs` (`applyPrefsIpc`) preserves `scriptOwner = .rootWheel`
+    `~/.tether-optimize.prefs` (`applyPrefsIpc`) preserves `scriptOwner = .rootWheel`
     and never grants unprivileged write access to the root executable. -/
 theorem prefs_ipc_preserves_root_ownership (d u : Nat) (sh : Bool) :
     (applyPrefsIpc d u sh).scriptOwner = .rootWheel ∧

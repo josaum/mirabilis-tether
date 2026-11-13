@@ -1,6 +1,6 @@
-# Makefile — Tether-Optimize v1.1.3 Product Build, Verification & Packaging
+# Makefile — Tether-Optimize v1.1.4 Product Build, Verification & Packaging
 SHELL := /bin/bash
-VERSION := 1.1.3
+VERSION := 1.1.4
 
 .PHONY: all build install uninstall verify verify-lean test doctor pkg web clean
 
@@ -19,16 +19,16 @@ uninstall:
 	./scripts/uninstall.sh
 
 verify:
-	/Users/josaum/bin/tether-optimize verify
+	./bin/tether-optimize verify
 
 verify-lean:
-	/Users/josaum/bin/tether-optimize verify-lean
+	./bin/tether-optimize verify-lean
 
 test:
-	/Users/josaum/bin/tether-optimize test
+	./bin/tether-optimize test
 
 doctor:
-	/Users/josaum/bin/tether-optimize doctor
+	./bin/tether-optimize doctor
 
 pkg:
 	./scripts/build-release.sh

@@ -37,6 +37,8 @@ PERSONAL_PATTERNS = [
     r"(?i)leio-embed",
     r"(?i)central-tether",
     r"(?i)ts-webhook",
+    r"/Users/josaum",
+    r"/home/josaum",
 ]
 
 SHIPPED_FILES = [
