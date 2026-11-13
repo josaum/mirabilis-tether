@@ -46,10 +46,19 @@ jobs:
             test "${code}" = "200"
           done
 
-      - name: Lean 4 proofs (skipped when the toolchain is absent)
+      - name: Install Lean 4.35.0 toolchain
+        timeout-minutes: 10
         run: |
           if command -v lean >/dev/null 2>&1; then
-            lean --run proofs/TetherOptimizeSpec.lean
+            echo "lean already present: $(lean --version)"
           else
-            echo "lean not installed on this runner — skipping formal check"
+            curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.35.0
+            echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           fi
+
+      - name: Lean 4 proofs (110 theorems, 0 axioms)
+        timeout-minutes: 10
+        run: |
+          out=$(lean --run proofs/TetherOptimizeSpec.lean)
+          echo "$out" | tail -25
+          echo "$out" | grep -q "kernel-verified"
