@@ -26,7 +26,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.4"
+VERSION="1.1.5"
 WIFI_OFF=0
 SHAPE_ENABLED=1
 DOWN_MBPS=${TETHER_DOWN_MBPS:-25}
@@ -1121,20 +1121,29 @@ emit_watchlist_rules() {
     echo "block drop out quick inet6 from any to { ${joined} }"
   fi
   if (( ${#singles[@]} )); then
+    local -a dirs=()
+    local dirword rule addr dir proto extra src dst
     for rule in "${singles[@]}"; do
       IFS='|' read -r addr dir proto extra <<< "$rule"
-      if [[ "$dir" == "out" ]]; then src="any"; dst="$addr"; else src="$addr"; dst="any"; fi
-      case "$proto" in
-        tcp)
-          if [[ "$extra" == "syn" ]]; then
-            echo "block drop ${dir} quick inet proto tcp from ${src} to ${dst} flags S/SA"
-          else
-            echo "block drop ${dir} quick inet proto tcp from ${src} to ${dst}"
-          fi ;;
-        udp)  echo "block drop ${dir} quick inet proto udp from ${src} to ${dst}" ;;
-        icmp) echo "block drop ${dir} quick inet proto icmp from ${src} to ${dst} icmp-type echoreq" ;;
-        *)    echo "block drop ${dir} quick inet from ${src} to ${dst}" ;;
-      esac
+      if [[ "$dir" == "both" ]]; then
+        dirs=(in out)
+      else
+        dirs=("$dir")
+      fi
+      for dirword in "${dirs[@]}"; do
+        if [[ "$dirword" == "out" ]]; then src="any"; dst="$addr"; else src="$addr"; dst="any"; fi
+        case "$proto" in
+          tcp)
+            if [[ "$extra" == "syn" ]]; then
+              echo "block drop ${dirword} quick inet proto tcp from ${src} to ${dst} flags S/SA"
+            else
+              echo "block drop ${dirword} quick inet proto tcp from ${src} to ${dst}"
+            fi ;;
+          udp)  echo "block drop ${dirword} quick inet proto udp from ${src} to ${dst}" ;;
+          icmp) echo "block drop ${dirword} quick inet proto icmp from ${src} to ${dst} icmp-type echoreq" ;;
+          *)    echo "block drop ${dirword} quick inet from ${src} to ${dst}" ;;
+        esac
+      done
     done
   fi
 }

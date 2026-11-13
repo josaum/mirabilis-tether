@@ -122,6 +122,15 @@ class WatchlistRulesTest(unittest.TestCase):
         self.assertIn("block drop out quick inet proto tcp from any to 203.0.113.8", out)
         self.assertIn("block drop in quick inet proto icmp from 203.0.113.9 to any icmp-type echoreq", out)
 
+    def test_both_with_protocol_expands_to_in_and_out(self):
+        path = self.write_watchlist("198.51.100.5 both udp\n203.0.113.7 both tcp syn\n")
+        out = run_emit(path)
+        self.assertIn("block drop in quick inet proto udp from 198.51.100.5 to any", out)
+        self.assertIn("block drop out quick inet proto udp from any to 198.51.100.5", out)
+        self.assertIn("block drop in quick inet proto tcp from 203.0.113.7 to any flags S/SA", out)
+        self.assertIn("block drop out quick inet proto tcp from any to 203.0.113.7 flags S/SA", out)
+        self.assertNotIn("block drop both ", out)
+
     def test_comments_and_blank_lines_are_ignored(self):
         path = self.write_watchlist("# comment\n\n192.0.2.20  # trailing note\n")
         out = run_emit(path)

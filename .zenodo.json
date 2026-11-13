@@ -2,7 +2,7 @@
   "title": "Mirabilis-Tether: Formally Verified Cellular Hotspot Control via Pontryagin's Maximum Principle, Inverse-Gamma Fat-Tail Debiasing, and Clock-Offset-Cancelled One-Way Delay",
   "upload_type": "publication",
   "publication_type": "article",
-  "description": "Mirabilis-Tether (tether-optimize v1.1.4) is an event-driven macOS/XNU kernel optimization engine and native menu bar suite whose entire mathematical and state-transition specification is machine-checked in 110 zero-axiom constructive Lean 4 theorems (TetherOptimizeSpec.lean, 4,099 lines, zero external imports) and validated at runtime by 84 live system assertions plus unit and guard tests. Unifies Mirabilis Abbreviatio Inverse-Gamma(n, n*alpha) small-sample Hill-Taleb Pareto tail debiasing, the Cirillo-Taleb compact-support Shadow Mean, a discrete formulation of Pontryagin's Maximum Principle over logarithmic Kelly utility solved via the floor-division Galois connection, a 1-step Revealed-Capacity Costate Dual driven by 64-bit NET_RT_IFLIST2 kernel counters, and a parallel 3-reflector BSD IPPROTO_ICMP RFC 792 Type 13/14 One-Way Delay quorum that cancels arbitrary host-reflector clock offsets.",
+  "description": "Mirabilis-Tether (tether-optimize v1.1.5) is an event-driven macOS/XNU kernel optimization engine and native menu bar suite whose entire mathematical and state-transition specification is machine-checked in 110 zero-axiom constructive Lean 4 theorems (TetherOptimizeSpec.lean, 4,099 lines, zero external imports) and validated at runtime by 84 live system assertions plus unit and guard tests. Unifies Mirabilis Abbreviatio Inverse-Gamma(n, n*alpha) small-sample Hill-Taleb Pareto tail debiasing, the Cirillo-Taleb compact-support Shadow Mean, a discrete formulation of Pontryagin's Maximum Principle over logarithmic Kelly utility solved via the floor-division Galois connection, a 1-step Revealed-Capacity Costate Dual driven by 64-bit NET_RT_IFLIST2 kernel counters, and a parallel 3-reflector BSD IPPROTO_ICMP RFC 792 Type 13/14 One-Way Delay quorum that cancels arbitrary host-reflector clock offsets.",
   "creators": [
     {
       "name": "Chiuratto Agourakis, Dionisio",
@@ -32,5 +32,5 @@
       "resource_type": "software"
     }
   ],
-  "version": "1.1.4"
+  "version": "1.1.5"
 }

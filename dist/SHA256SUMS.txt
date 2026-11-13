@@ -1,2 +1,2 @@
-a1d056e46d95efe69e15d66cce8a07e612d0e44b4a4d733e189fc68eaa6b4c9a  TetherOptimize-1.1.4-macos-arm64.pkg
-31fce97db20364a3249cebdbde92c509c9de018ffc67ba8d64c62210b3f8a7c3  TetherOptimize-1.1.4-macos-arm64.tar.gz
+23c4cb7ecaff4f6c9e9fe38a648279921a96ab5fadbc12d87588ad8611640935  TetherOptimize-1.1.5-macos-arm64.pkg
+ba8e0ba98684175c296926c038680b49b1678243a123fa395df4bf4d29cc7c93  TetherOptimize-1.1.5-macos-arm64.tar.gz

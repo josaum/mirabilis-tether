@@ -1,4 +1,4 @@
-# Mirabilis-Tether (`tether-optimize` v1.1.4)
+# Mirabilis-Tether (`tether-optimize` v1.1.5)
 ### *Mirabilis Abbreviatio* — Formally Verified macOS Personal Hotspot & WAN Optimizer
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24100456.svg)](https://doi.org/10.5281/zenodo.24100456)
@@ -23,7 +23,7 @@ When a Mac tethers to an iPhone, iPad, or Android phone, six compounding OS and 
    - *Fix*: Clamps socket buffers, enables L4S + FQ-CoDel ECN (`net.inet.tcp.l4s=1`), reserves an 80% proportional Fast-Lane (`dnctl` Pipes `#10`/`#11`) for interactive traffic (`ICMP`, `DNS`, `SSH`, `NTP`, `DoT`, `WireGuard`), and shapes bulk queues (`Pipes #12`/`#13`) via **Pontryagin's Maximum Principle** around target queue delay $\tau_0 = 20\text{ ms}$ (**Theorems 9, 101–105**).
 2. **Self-Inflicted Download Throttling During Heavy Uploads (Symmetric Ping Blindness)**:
    - *Pathology*: Standard autorate controllers measure symmetric Echo RTT (`Type 8/0`). When a cloud backup or `git push` saturates the 5G/LTE uplink, symmetric RTT rises and the controller mistakenly slashes the *download* pipe by 50–80%.
-   - *Fix*: Uses parallel BSD `SOCK_DGRAM` `IPPROTO_ICMP` **RFC 792 Type 13/14 Timestamp probes** across a 3-reflector quorum (`9.9.9.9`, `149.112.112.112`, `1.1.4.1`) to cancel arbitrary host-reflector clock offset $\theta \in \mathbb{Z}$ and isolate directional queueing delays $(\Delta q_\uparrow, \Delta q_\downarrow)$ (**Theorems 106 & 107**).
+   - *Fix*: Uses parallel BSD `SOCK_DGRAM` `IPPROTO_ICMP` **RFC 792 Type 13/14 Timestamp probes** across a 3-reflector quorum (`9.9.9.9`, `149.112.112.112`, `1.1.5.1`) to cancel arbitrary host-reflector clock offset $\theta \in \mathbb{Z}$ and isolate directional queueing delays $(\Delta q_\uparrow, \Delta q_\downarrow)$ (**Theorems 106 & 107**).
 3. **Multi-Second Lag on Abrupt Cellular Fades (`5,500 ms` AIMD Decay vs `500 ms` 1-Step Capture)**:
    - *Pathology*: When stepping into an elevator or cellular shadow (e.g., capacity drops from `100 Mbps` to `12 Mbps`), multiplicative decrease (`×0.8` per step) takes **11 control cycles (`5.5 seconds`)** to catch up, causing massive packet loss.
    - *Fix*: Computes the **Revealed-Capacity Costate** $\lambda_{\text{cap}}(W, \hat{r}) = \lfloor W/(\hat{r}+1)\rfloor + 1$ from zero-fork 64-bit `NET_RT_IFLIST2` kernel byte counters, snapping $u^\star(\lambda)$ to the true bottleneck $\hat{r} = 12\text{ Mbps}$ in **a single `500 ms` step** (**Theorem 108**).
@@ -45,7 +45,7 @@ All measurements below were executed live on an **Apple M1 Mac** (`macOS 26.5.2`
 
 ### 2.1 Live System & Kernel Microbenchmarks (Measured on Apple M1)
 
-| Subsystem / Operation | Legacy / Baseline Approach | Mirabilis-Tether (`v1.1.4`) | Measured Result / Speedup | Reproducibility Command |
+| Subsystem / Operation | Legacy / Baseline Approach | Mirabilis-Tether (`v1.1.5`) | Measured Result / Speedup | Reproducibility Command |
 | :--- | :--- | :--- | :--- | :--- |
 | **64-bit Interface Byte Sensing** | Forking `/usr/sbin/netstat -ibn` (`5.41 ms` / call) | In-process `sysctl(NET_RT_IFLIST2)` (`if_msghdr2`) | **`7.8 µs` / call (`697×` faster, `0` forks)** | `tether-events --probe en0` |
 | **Idle Daemon CPU & Memory** | Polling shell loops (`0.4%` CPU, `20` pings/min) | `kqueue` + `AF_ROUTE` (`tether-events`) | **`0.0%` CPU, `2.64 MB` RSS (`2,704 KB`), `0` idle pings** | `ps -o pid,%cpu,rss,comm -p $(pgrep -x tether-events)` |
@@ -73,7 +73,7 @@ All measurements below were executed live on an **Apple M1 Mac** (`macOS 26.5.2`
 | Layer | Component | Mechanism & Formal Guarantee |
 | :--- | :--- | :--- |
 | **1. Event-Driven XNU Reactor** | [`src/tether-events.swift`](src/tether-events.swift) | `AF_ROUTE` raw kernel socket + `kqueue` (`EVFILT_VNODE`, `EVFILT_TIMER`, `EVFILT_PROC`) + zero-fork 64-bit `NET_RT_IFLIST2` byte counters. `0` radio probes in idle (`<16 KB/s`, `3000 ms` sleep); `500 ms` fast control under load (**Theorem 110**). |
-| **2. Clock-Offset-Cancelled OWD Quorum** | [`src/tether-events.swift`](src/tether-events.swift) | Parallel BSD `SOCK_DGRAM` `IPPROTO_ICMP` 3-reflector quorum (`9.9.9.9` & `149.112.112.112` RFC 792 Type 13/14 Timestamp + `1.1.4.1` Type 8/0 Echo). Cancels arbitrary host-reflector clock offset $\theta \in \mathbb{Z}$ (**Theorem 106**) and rejects single-reflector glitches via Birkhoff distributive `median3` (**Theorem 107**). |
+| **2. Clock-Offset-Cancelled OWD Quorum** | [`src/tether-events.swift`](src/tether-events.swift) | Parallel BSD `SOCK_DGRAM` `IPPROTO_ICMP` 3-reflector quorum (`9.9.9.9` & `149.112.112.112` RFC 792 Type 13/14 Timestamp + `1.1.5.1` Type 8/0 Echo). Cancels arbitrary host-reflector clock offset $\theta \in \mathbb{Z}$ (**Theorem 106**) and rejects single-reflector glitches via Birkhoff distributive `median3` (**Theorem 107**). |
 | **3. Taleb Fat-Tail Estimation** | [`bin/tether-optimize`](bin/tether-optimize) | Models Pareto/Lomax tail index $\widehat{\alpha}_{\text{MLE}} \sim \text{InvGamma}(n, n\alpha)$, applies exact $\frac{n-1}{n}$ small-sample debiasing $\widehat{\alpha}_0 = \frac{n-1}{S_n}$, and computes the Cirillo–Taleb Shadow Mean across $\alpha \le 1$ (**Theorems 96–100**). |
 | **4. Pontryagin Hamiltonian Control** | [`bin/tether-optimize`](bin/tether-optimize) | Maximizes the discrete Kelly–Pontryagin Hamiltonian $\mathcal{H}(q, u, -\lambda) = U_W(u) + \lambda(u_{\max} - u)$ via Galois floor-division duality $u^\star(\lambda) = \operatorname{clamp}_{[u_{\min}, u_{\max}]}(\lfloor W/\lambda \rfloor)$ (**Theorems 101–105**) with 1-step revealed-capacity fade capture $\lambda_{\text{cap}}(W, \hat{r}) = \lfloor W/(\hat{r}+1)\rfloor + 1$ (**Theorem 108**). |
 | **5. Dual PF Scrub & BDP-Isochronous GRED** | [`bin/tether-optimize`](bin/tether-optimize) | Enforces outer MSS (`1380 B` Hotspot / `1452 B` Home IPv4 / `1432 B` Home IPv6), inner VPN `utun*` MSS (`1220 B` Hotspot / `1332 B` Home), and rate-adaptive CoDel/GRED dummynet queues (**Theorems 13–28, 93, 109**). |
@@ -93,7 +93,7 @@ tether-optimize/
 │   ├── mirabilis_tether.tex                  # LaTeX source of the research paper
 │   └── MIRABILIS_TETHER_PAPER.md             # GitHub-rendered Markdown edition of the paper
 ├── bin/
-│   ├── tether-optimize                       # Portable CLI & root daemon engine (v1.1.4)
+│   ├── tether-optimize                       # Portable CLI & root daemon engine (v1.1.5)
 │   └── tether-events                         # Compiled XNU kqueue + RFC 792 OWD reactor
 ├── src/
 │   ├── tether-events.swift                   # XNU kqueue + PF_ROUTE + RFC 792 OWD reactor source
@@ -122,8 +122,8 @@ tether-optimize/
 │       ├── app.css                           # Styling and design tokens
 │       └── app.js                            # Live polling, charts, model math, theorem browser
 └── dist/
-    ├── TetherOptimize-1.1.4-macos-arm64.pkg
-    ├── TetherOptimize-1.1.4-macos-arm64.tar.gz
+    ├── TetherOptimize-1.1.5-macos-arm64.pkg
+    ├── TetherOptimize-1.1.5-macos-arm64.tar.gz
     └── SHA256SUMS.txt
 ```
 
@@ -207,7 +207,7 @@ To independently verify the entire mathematical specification and live kernel in
    ```bash
    make pkg
    ```
-   Produces `dist/TetherOptimize-1.1.4-macos-arm64.pkg`, `dist/TetherOptimize-1.1.4-macos-arm64.tar.gz`, and `dist/SHA256SUMS.txt`.
+   Produces `dist/TetherOptimize-1.1.5-macos-arm64.pkg`, `dist/TetherOptimize-1.1.5-macos-arm64.tar.gz`, and `dist/SHA256SUMS.txt`.
 
 ---
 
@@ -232,7 +232,7 @@ To independently verify the entire mathematical specification and live kernel in
   year         = {2026},
   month        = nov,
   publisher    = {Zenodo},
-  version      = {1.1.4},
+  version      = {1.1.5},
   doi          = {10.5281/zenodo.24100456},
   url          = {https://doi.org/10.5281/zenodo.24100456}
 }
