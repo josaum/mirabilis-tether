@@ -26,7 +26,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.6"
+VERSION="1.1.7"
 WIFI_OFF=0
 SHAPE_ENABLED=1
 DOWN_MBPS=${TETHER_DOWN_MBPS:-25}
@@ -46,6 +46,7 @@ LAST_PCAP_FILE="/tmp/tether-optimize-audit.pcapng"
 WEB_ARG=""
 WEB_WORKBENCH_PORT=""
 EMIT_MSS=""
+BENCH_SECS=20
 
 resolve_user_home() {
   if [[ -n "${TETHER_HOME:-}" && -d "${TETHER_HOME}" ]]; then
@@ -137,6 +138,7 @@ tether-optimize — Smartphone & iPad Personal Hotspot Optimizer (Wi-Fi en0 + US
     tether-optimize restore         apply/restore optimized Standard Home Wi-Fi & LAN profile
     tether-optimize pcap [secs]     run on-demand Wireshark (dumpcap/tshark/Lua) wire audit (default: 4s)
     tether-optimize owd-probe       run live 3-reflector RFC 792 Type 13/14 One-Way Delay quorum probe
+    tether-optimize benchmark       A/B bufferbloat test (shaper off vs on) — measured before/after
     tether-optimize tail-mle [...]  Taleb Pareto(L, α) MLE ~ InvGamma(n, nα) & Pontryagin u*(λ) control
     tether-optimize wireshark-gui   open last audit capture in Wireshark.app (Tether-Optimize profile)
     tether-optimize web             serve the live workbench on 127.0.0.1:7180 and open it (--static: open file copy, --port <n>)
@@ -307,6 +309,15 @@ while [[ $# -gt 0 ]]; do
       EMIT_MSS="${1:-}"
       [[ -n "$EMIT_MSS" ]] && shift
       break
+      ;;
+    benchmark)
+      MODE=benchmark; shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --seconds) BENCH_SECS=${2:?Usage: tether-optimize benchmark --seconds <n>}; shift 2 ;;
+          *) echo "Unknown benchmark option: $1" >&2; exit 2 ;;
+        esac
+      done
       ;;
     -v|--version)
       MODE=version; shift ;;
@@ -2700,6 +2711,118 @@ open_wireshark_gui() {
   echo "Opened $LAST_PCAP_FILE in Wireshark.app (Profile: Tether-Optimize)."
 }
 
+# --- A/B bufferbloat benchmark --------------------------------------------------
+# Measures the same saturated link with shaping off vs on, so the benefit is a
+# field capture rather than a theorem bound. Saturates the queue with a bounded
+# Cloudflare download while sampling gateway RTT and HTTP time-to-first-byte, then
+# reports p50/p95/max for each phase. Requires root (applies the shaper).
+pct() {
+  awk -v p="$1" '
+    { v[++n] = $1 + 0 }
+    END {
+      if (n == 0) { print "-"; exit }
+      for (i = 1; i <= n; i++) for (j = i + 1; j <= n; j++) if (v[j] < v[i]) { t = v[i]; v[i] = v[j]; v[j] = t }
+      k = int((p / 100) * n + 0.5); if (k < 1) k = 1; if (k > n) k = n
+      printf "%.1f", v[k]
+    }'
+}
+
+saturate_and_sample() {
+  local seconds=$1
+  local bytes=$(( DOWN_MBPS * seconds * 250000 ))   # ~2x oversubscribe to keep the queue full
+  (( bytes > 2000000000 )) && bytes=2000000000
+  (( bytes < 10000000 )) && bytes=10000000
+  local url="https://speed.cloudflare.com/__down?bytes=${bytes}"
+
+  curl -s -o /dev/null --max-time "$seconds" "$url" &
+  local dl=$!
+
+  local gw t0=$SECONDS r h
+  gw=$(/sbin/route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+  : > /tmp/tether-bench-rtt.$$.txt
+  : > /tmp/tether-bench-http.$$.txt
+  while (( SECONDS - t0 < seconds )); do
+    if [[ -n "$gw" ]]; then
+      r=$(ping -c 1 -t 1 -q "$gw" 2>/dev/null | awk -F/ '/round-trip/{print $5}')
+      [[ -n "$r" ]] && printf '%s\n' "$r" >> /tmp/tether-bench-rtt.$$.txt
+    fi
+    h=$(curl -s -o /dev/null -w '%{time_starttransfer}' --max-time 3 https://1.1.1.1/cdn-cgi/trace 2>/dev/null)
+    [[ -n "$h" ]] && awk -v x="$h" 'BEGIN{printf "%.1f\n", x*1000}' >> /tmp/tether-bench-http.$$.txt
+    sleep 0.4
+  done
+  wait "$dl" 2>/dev/null
+
+  printf '%s %s %s %s %s %s\n' \
+    "$(pct 50 < /tmp/tether-bench-rtt.$$.txt)" \
+    "$(pct 95 < /tmp/tether-bench-rtt.$$.txt)" \
+    "$(pct 100 < /tmp/tether-bench-rtt.$$.txt)" \
+    "$(pct 50 < /tmp/tether-bench-http.$$.txt)" \
+    "$(pct 95 < /tmp/tether-bench-http.$$.txt)" \
+    "$(pct 100 < /tmp/tether-bench-http.$$.txt)"
+  rm -f /tmp/tether-bench-rtt.$$.txt /tmp/tether-bench-http.$$.txt
+}
+
+benchmark_cli() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "Error: benchmark applies/unapplies the shaper, so it must run as root." >&2
+    echo "Run:  sudo tether-optimize benchmark [seconds]" >&2
+    exit 1
+  fi
+
+  local seconds=${1:-20}
+  [[ "$seconds" =~ ^[0-9]+$ ]] || { echo "Usage: tether-optimize benchmark [seconds]" >&2; exit 2; }
+
+  local detected dev
+  detected=$(detect_active_hotspot 2>/dev/null || true)
+  dev=$(printf '%s\n' "$detected" | head -1)
+  [[ -z "$dev" ]] && dev=$(/sbin/route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+
+  local est_mb=$(( DOWN_MBPS * seconds / 8 ))
+  echo "A/B bufferbloat benchmark on ${dev} — ~${est_mb} MB down per phase, ${seconds}s each."
+  echo "Saturates the link on purpose; stop now if cellular data is metered. Proceeding…"
+  echo
+
+  local prev_shape=$SHAPE_ENABLED
+  local out_dir; mkdir -p "$USER_STATE_DIR" 2>/dev/null && out_dir="$USER_STATE_DIR" || out_dir="/tmp"
+
+  # Phase A: stock (no bandwidth cap; TCP/MSS/AWDL guards still applied)
+  echo "Phase A — shaper OFF …"
+  SHAPE_ENABLED=0; apply >/dev/null 2>&1
+  local stock; stock=$(saturate_and_sample "$seconds")
+
+  # Phase B: shaped
+  echo "Phase B — shaper ON (${DOWN_MBPS}/${UP_MBPS} Mbps) …"
+  SHAPE_ENABLED=1; apply >/dev/null 2>&1
+  local shaped; shaped=$(saturate_and_sample "$seconds")
+
+  # Restore previous shaping state
+  SHAPE_ENABLED=$prev_shape; apply >/dev/null 2>&1
+
+  local s5 s95 smax h5 h95 hmax
+  read -r s5 s95 smax h5 h95 hmax <<< "$stock"
+  local t5 t95 tmax g5 g95 gmax
+  read -r t5 t95 tmax g5 g95 gmax <<< "$shaped"
+
+  printf '\n%s\n' "=== A/B result (gateway RTT ms: p50 / p95 / max · HTTP TTFB ms: p50 / p95 / max) ==="
+  printf '%-14s %12s %12s\n' "" "stock" "shaped"
+  printf '%-14s %12s %12s\n' "RTT p50"   "$s5"  "$t5"
+  printf '%-14s %12s %12s\n' "RTT p95"   "$s95" "$t95"
+  printf '%-14s %12s %12s\n' "RTT max"   "$smax" "$tmax"
+  printf '%-14s %12s %12s\n' "TTFB p50"  "$h5"  "$g5"
+  printf '%-14s %12s %12s\n' "TTFB p95"  "$h95" "$g95"
+  printf '%-14s %12s %12s\n' "TTFB max"  "$hmax" "$gmax"
+
+  {
+    printf '{"ts":%s,"device":"%s","down_mbps":%s,"up_mbps":%s,"seconds":%s,\n' \
+      "$(date +%s)" "$dev" "$DOWN_MBPS" "$UP_MBPS" "$seconds"
+    printf ' "stock":{"rtt_p50":%s,"rtt_p95":%s,"rtt_max":%s,"ttfb_p50":%s,"ttfb_p95":%s,"ttfb_max":%s},\n' \
+      "$s5" "$s95" "$smax" "$h5" "$h95" "$hmax"
+    printf ' "shaped":{"rtt_p50":%s,"rtt_p95":%s,"rtt_max":%s,"ttfb_p50":%s,"ttfb_p95":%s,"ttfb_max":%s}}\n' \
+      "$t5" "$t95" "$tmax" "$g5" "$g95" "$gmax"
+  } > "${out_dir}/benchmark.json" 2>/dev/null || true
+  echo "Saved to ${out_dir}/benchmark.json"
+}
+
 open_web_workbench() {
   local mode="${1:-live}"
   if [[ "$mode" == "--static" ]]; then
@@ -3159,6 +3282,7 @@ case "$MODE" in
   restore) restore; status ;;
   pcap) pcap_audit "$PCAP_SECS" ;;
   owd-probe) owd_probe_cli ;;
+  benchmark) benchmark_cli "$BENCH_SECS" ;;
   tail-mle) tail_mle_cli "${TAIL_MLE_ARGS[@]+"${TAIL_MLE_ARGS[@]}"}" ;;
   wireshark-gui) open_wireshark_gui ;;
   web|workbench) open_web_workbench "$WEB_ARG" ;;

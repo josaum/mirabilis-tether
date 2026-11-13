@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# uninstall.sh — Clean uninstaller for Tether-Optimize v1.1.6
+# uninstall.sh — Clean uninstaller for Tether-Optimize v1.1.7
 set -euo pipefail
 
 TARGET_USER="${SUDO_USER:-$(stat -f%Su /dev/console 2>/dev/null || id -un)}"

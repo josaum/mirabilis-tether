@@ -4,7 +4,7 @@ set -euo pipefail
 export COPYFILE_DISABLE=1
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VERSION="1.1.6"
+VERSION="1.1.7"
 DIST_DIR="${REPO_ROOT}/dist"
 STAGE_DIR="/tmp/tether-optimize-pkg-stage.$$"
 PKG_ROOT="${STAGE_DIR}/root"
@@ -59,6 +59,29 @@ pkgbuild \
   --version "${VERSION}" \
   --install-location "/" \
   "${PKG_FILE}" >/dev/null
+
+# 3b. Sign + notarize when a Developer ID is available, otherwise ship unsigned.
+#     Requires APPLE_DEVELOPER_IDENTITY (e.g. "Developer ID Application: …"),
+#     APPLE_INSTALLER_IDENTITY ("Developer ID Installer: …"), APPLE_ID, and an
+#     app-specific password in APPLE_APP_SPECIFIC_PASSWORD.
+if [[ -n "${APPLE_DEVELOPER_IDENTITY:-}" && -n "${APPLE_INSTALLER_IDENTITY:-}" ]]; then
+  APP_PATH="${PKG_ROOT}/Users/${TARGET_USER:-josaum}/Applications/TetherMenubar.app"
+  if [[ -d "$APP_PATH" ]]; then
+    codesign --force --deep --options runtime --timestamp \
+      --sign "${APPLE_DEVELOPER_IDENTITY}" "$APP_PATH" >/dev/null
+  fi
+  SIGNED_PKG="${DIST_DIR}/TetherOptimize-${VERSION}-macos-arm64-signed.pkg"
+  productsign --sign "${APPLE_INSTALLER_IDENTITY}" "${PKG_FILE}" "${SIGNED_PKG}" >/dev/null
+  mv -f "${SIGNED_PKG}" "${PKG_FILE}"
+  if [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+    xcrun notarytool submit "${PKG_FILE}" --apple-id "${APPLE_ID}" \
+      --password "${APPLE_APP_SPECIFIC_PASSWORD}" --team-id "${APPLE_TEAM_ID}" --wait >/dev/null
+    xcrun stapler staple "${PKG_FILE}" >/dev/null 2>&1 || true
+  fi
+  echo "✓ Signed package: ${PKG_FILE}"
+else
+  echo "ℹ Unsigned package (set APPLE_DEVELOPER_IDENTITY + APPLE_INSTALLER_IDENTITY to sign/notarize)"
+fi
 
 # 4. Build portable .tar.gz archive
 TAR_FILE="${DIST_DIR}/TetherOptimize-${VERSION}-macos-arm64.tar.gz"

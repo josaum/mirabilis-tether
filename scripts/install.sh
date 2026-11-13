@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — Zero-dependency macOS installer for Tether-Optimize v1.1.6
+# install.sh — Zero-dependency macOS installer for Tether-Optimize v1.1.7
 set -euo pipefail
 
 # The product ships a root LaunchDaemon and a root-locked ~/bin/tether-optimize
@@ -19,7 +19,7 @@ APP_DIR="${USER_HOME}/Applications/TetherMenubar.app"
 WIRESHARK_PLUGIN_DIR="${USER_HOME}/.local/lib/wireshark/plugins"
 LAUNCH_AGENT_DIR="${USER_HOME}/Library/LaunchAgents"
 
-echo "=== Installing Tether-Optimize v1.1.6 ==="
+echo "=== Installing Tether-Optimize v1.1.7 ==="
 echo "  Target User : ${TARGET_USER} (${USER_HOME})"
 echo "  Binary Dir  : ${BIN_DIR}"
 echo "  Menubar App : ${APP_DIR}"
@@ -57,6 +57,9 @@ stage_asset "${REPO_ROOT}/web/serve.py"        "${WEB_TARGET_DIR}/serve.py"
 stage_asset "${REPO_ROOT}/web/static/app.css"  "${WEB_TARGET_DIR}/static/app.css"
 stage_asset "${REPO_ROOT}/web/static/app.js"   "${WEB_TARGET_DIR}/static/app.js"
 chmod 755 "${WEB_TARGET_DIR}/serve.py"
+# The web dir doubles as the source checkout for this user, so a root install must
+# not leave the repo files root-owned — hand them back to the target user.
+chown -R "${TARGET_USER}" "${WEB_TARGET_DIR}" 2>/dev/null || true
 
 # 1c. Site-local peer data: ship the empty watchlist template once, then respect
 #     the operator's own file; local peer labels go next to the Lua plugin.
@@ -93,7 +96,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<'EOF'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.1.6</string>
+  <string>1.1.7</string>
   <key>CFBundleVersion</key>
   <string>100</string>
   <key>LSUIElement</key>
@@ -137,5 +140,5 @@ else
   echo "    launchctl bootstrap gui/${USER_UID} ${LAUNCH_AGENT_DIR}/com.josaum.tether-menubar.plist" >&2
 fi
 
-echo "✓ Tether-Optimize v1.1.6 installed."
+echo "✓ Tether-Optimize v1.1.7 installed."
 echo "  Run '${BIN_DIR}/tether-optimize doctor' or '${BIN_DIR}/tether-optimize verify' to verify."
