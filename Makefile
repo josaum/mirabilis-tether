@@ -1,6 +1,6 @@
-# Makefile — Tether-Optimize v1.1.2 Product Build, Verification & Packaging
+# Makefile — Tether-Optimize v1.1.3 Product Build, Verification & Packaging
 SHELL := /bin/bash
-VERSION := 1.1.2
+VERSION := 1.1.3
 
 .PHONY: all build install uninstall verify verify-lean test doctor pkg web clean
 
