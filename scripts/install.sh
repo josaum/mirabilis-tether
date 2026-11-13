@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# install.sh — Zero-dependency macOS installer for Tether-Optimize v1.1.5
+# install.sh — Zero-dependency macOS installer for Tether-Optimize v1.1.6
 set -euo pipefail
+
+# The product ships a root LaunchDaemon and a root-locked ~/bin/tether-optimize
+# (assert 21 and Theorem 30 require root:wheel ownership), so the installer must
+# run as root — a non-root run otherwise leaves a stale, tamperable binary behind.
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "Tether-Optimize installs a root daemon and a root-locked binary — re-running with sudo…"
+  exec sudo "$0" "$@"
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET_USER="${SUDO_USER:-$(stat -f%Su /dev/console 2>/dev/null || id -un)}"
@@ -11,7 +19,7 @@ APP_DIR="${USER_HOME}/Applications/TetherMenubar.app"
 WIRESHARK_PLUGIN_DIR="${USER_HOME}/.local/lib/wireshark/plugins"
 LAUNCH_AGENT_DIR="${USER_HOME}/Library/LaunchAgents"
 
-echo "=== Installing Tether-Optimize v1.1.5 ==="
+echo "=== Installing Tether-Optimize v1.1.6 ==="
 echo "  Target User : ${TARGET_USER} (${USER_HOME})"
 echo "  Binary Dir  : ${BIN_DIR}"
 echo "  Menubar App : ${APP_DIR}"
@@ -85,7 +93,7 @@ cat > "${APP_DIR}/Contents/Info.plist" <<'EOF'
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.1.5</string>
+  <string>1.1.6</string>
   <key>CFBundleVersion</key>
   <string>100</string>
   <key>LSUIElement</key>
@@ -112,8 +120,22 @@ mv -f "/tmp/tether-optimize.$$" "${BIN_DIR}/tether-optimize"
 # 5. Restart TetherMenubar LaunchAgent
 USER_UID=$(id -u "${TARGET_USER}")
 launchctl bootout "gui/${USER_UID}/com.josaum.tether-menubar" 2>/dev/null || true
-launchctl bootstrap "gui/${USER_UID}" "${LAUNCH_AGENT_DIR}/com.josaum.tether-menubar.plist" 2>/dev/null || true
-launchctl kickstart -k "gui/${USER_UID}/com.josaum.tether-menubar" 2>/dev/null || true
+# bootout is asynchronous: an immediate bootstrap fails with "Input/output error" and,
+# with errors silenced, left the menubar agent unloaded. Retry until it takes, then fail loudly.
+menubar_loaded=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if launchctl bootstrap "gui/${USER_UID}" "${LAUNCH_AGENT_DIR}/com.josaum.tether-menubar.plist" 2>/dev/null; then
+    menubar_loaded=1
+    break
+  fi
+  sleep 1
+done
+if [ "${menubar_loaded}" -eq 1 ]; then
+  launchctl kickstart -k "gui/${USER_UID}/com.josaum.tether-menubar" 2>/dev/null || true
+else
+  echo "✗ Could not load the TetherMenubar LaunchAgent. Load it by hand:" >&2
+  echo "    launchctl bootstrap gui/${USER_UID} ${LAUNCH_AGENT_DIR}/com.josaum.tether-menubar.plist" >&2
+fi
 
-echo "✓ Tether-Optimize v1.1.5 installed."
+echo "✓ Tether-Optimize v1.1.6 installed."
 echo "  Run '${BIN_DIR}/tether-optimize doctor' or '${BIN_DIR}/tether-optimize verify' to verify."

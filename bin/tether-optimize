@@ -26,7 +26,7 @@
 #
 set -euo pipefail
 
-VERSION="1.1.5"
+VERSION="1.1.6"
 WIFI_OFF=0
 SHAPE_ENABLED=1
 DOWN_MBPS=${TETHER_DOWN_MBPS:-25}
@@ -3034,7 +3034,7 @@ EOF
   assert_ok "Wireshark Lua post-dissector registers RFC 792 OWD field (tether.icmp_owd) & adaptive 500ms fasttick active" \
     "tshark -G fields 2>/dev/null | grep -q 'tether.icmp_owd' && grep -q 'fasttick|' \"\$EVENTS_SRC\""
   assert_ok "Portable product packaging (v${VERSION}, resolve_user_home, installer & web workbench) ready" \
-    "[[ \"\$VERSION\" == '1.0.0' && -d \"\$TETHER_USER_HOME\" && -f \"\$WEB_WORKBENCH_FILE\" ]]"
+    "[[ -n \"\$VERSION\" && \"\$VERSION\" != *[!0-9.]* && -d \"\$TETHER_USER_HOME\" && -f \"\$WEB_WORKBENCH_FILE\" ]]"
   local pf_test_tmp="/tmp/tether-pf-selftest.$$.conf" pf_hs_tmp="/tmp/tether-pf-hs-selftest.$$.conf"
   emit_common_pf_tail 1332 > "$pf_test_tmp"
   {

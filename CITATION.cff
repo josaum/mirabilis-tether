@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use Mirabilis-Tether or its Lean 4 formal specification in your research or systems work, please cite it as below."
 title: "Mirabilis-Tether: Formally Verified Cellular Hotspot Control via Pontryagin's Maximum Principle, Inverse-Gamma Fat-Tail Debiasing, and Clock-Offset-Cancelled One-Way Delay"
-version: 1.1.5
+version: 1.1.6
 doi: 10.5281/zenodo.24100456
 date-released: 2026-11-10
 url: "https://github.com/josaum/mirabilis-tether"
