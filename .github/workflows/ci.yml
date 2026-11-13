@@ -46,15 +46,22 @@ jobs:
             test "${code}" = "200"
           done
 
+      - name: Cache Lean toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.elan
+          key: lean-4.35.0-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install Lean 4.35.0 toolchain
         timeout-minutes: 10
         run: |
+          export PATH="$HOME/.elan/bin:$PATH"
           if command -v lean >/dev/null 2>&1; then
             echo "lean already present: $(lean --version)"
           else
             curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain leanprover/lean4:v4.35.0
-            echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
 
       - name: Lean 4 proofs (110 theorems, 0 axioms)
         timeout-minutes: 10
